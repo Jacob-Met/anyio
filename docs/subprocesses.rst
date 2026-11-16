@@ -30,6 +30,14 @@ launch one with :func:`~open_process`:
 
 .. literalinclude:: snippets/subprocesses/open_process.py
 
+By default, when cancellation forces a subprocess to be killed, AnyIO waits
+until the operating system reaps it. Setting ``kill_timeout`` on
+:func:`~open_process` or :func:`~run_process` bounds this cleanup
+wait and raises :exc:`TimeoutError` if the child cannot exit in time.
+This does not limit normal subprocess execution. If a process remains
+uninterruptible, timing out can leave it running or unreaped. Use the timeout
+only when bounded cancellation is more important than guaranteed reaping.
+
 See the API documentation of :class:`~.abc.Process` for more information.
 
 .. _RunInProcess:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterable, Iterable, Mapping, Sequence
 from io import BytesIO
+from math import inf
 from os import PathLike
 from subprocess import PIPE, CalledProcessError, CompletedProcess
 from typing import IO, Any, TypeAlias, cast
@@ -31,6 +32,7 @@ async def run_process(
     group: str | int | None = None,
     extra_groups: Iterable[str | int] | None = None,
     umask: int = -1,
+    kill_timeout: float | None = None,
 ) -> CompletedProcess[bytes]:
     """
     Run an external command in a subprocess and wait until it completes.
@@ -66,6 +68,8 @@ async def run_process(
         POSIX only)
     :param umask: if not negative, this umask is applied in the child process before
         running the given command (Python >= 3.9, POSIX only)
+    :param kill_timeout: maximum seconds to wait after forcibly killing a process
+        during cancellation cleanup; by default, wait indefinitely
     :return: an object representing the completed process
     :raises ~subprocess.CalledProcessError: if ``check`` is ``True`` and the process
         exits with a nonzero return code
@@ -82,6 +86,10 @@ async def run_process(
     if stdin is not None and input is not None:
         raise ValueError("only one of stdin and input is allowed")
 
+    extra_kwargs: dict[str, Any] = {}
+    if kill_timeout is not None:
+        extra_kwargs["kill_timeout"] = kill_timeout
+
     async with await open_process(
         command,
         stdin=PIPE if input else stdin,
@@ -97,6 +105,7 @@ async def run_process(
         group=group,
         extra_groups=extra_groups,
         umask=umask,
+        **extra_kwargs,
     ) as process:
         stream_contents: list[bytes | None] = [None, None]
         async with create_task_group() as tg:
@@ -135,6 +144,7 @@ async def open_process(
     group: str | int | None = None,
     extra_groups: Iterable[str | int] | None = None,
     umask: int = -1,
+    kill_timeout: float | None = None,
 ) -> Process:
     """
     Start an external command in a subprocess.
@@ -165,9 +175,14 @@ async def open_process(
     :param extra_groups: supplementary groups to set in the subprocess (POSIX only)
     :param umask: if not negative, this umask is applied in the child process before
         running the given command (POSIX only)
+    :param kill_timeout: maximum seconds to wait after forcing termination during
+        cancellation cleanup; timeout may leave the child process unreaped
     :return: an asynchronous process object
 
     """
+    if kill_timeout is not None and not (0 < kill_timeout < inf):
+        raise ValueError("kill_timeout must be a positive, finite number or None")
+
     kwargs: dict[str, Any] = {}
     if user is not None:
         kwargs["user"] = user
@@ -180,6 +195,9 @@ async def open_process(
 
     if umask >= 0:
         kwargs["umask"] = umask
+
+    if kill_timeout is not None:
+        kwargs["kill_timeout"] = kill_timeout
 
     return await get_async_backend().open_process(
         command,

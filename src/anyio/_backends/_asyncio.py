@@ -92,7 +92,7 @@ from .._core._synchronization import (
 )
 from .._core._synchronization import Semaphore as BaseSemaphore
 from .._core._tasks import CancelScope as BaseCancelScope
-from .._core._tasks import TaskHandle
+from .._core._tasks import TaskHandle, fail_after
 from ..abc import (
     AsyncBackend,
     IPSockAddrType,
@@ -1154,6 +1154,7 @@ class Process(abc.Process):
     _stderr: StreamReaderWrapper | None
     _exited: asyncio.Event
     _transport: asyncio.SubprocessTransport
+    _kill_timeout: float | None = None
 
     async def aclose(self) -> None:
         with CancelScope(shield=True) as scope:
@@ -1179,7 +1180,18 @@ class Process(abc.Process):
                 scope.shield = True
                 # Closing the transport on asyncio also handles sending kill
                 self._transport.close()
-                await self.wait()
+                if self._kill_timeout is None:
+                    await self.wait()
+                else:
+                    with fail_after(
+                        self._kill_timeout,
+                        reason=(
+                            f"process {self.pid} did not exit within "
+                            f"{self._kill_timeout} seconds after kill"
+                        ),
+                    ):
+                        await self.wait()
+
                 raise
 
     async def wait(self) -> int:
@@ -2825,6 +2837,7 @@ class AsyncIOBackend(AsyncBackend):
         stdin: int | IO[Any] | None,
         stdout: int | IO[Any] | None,
         stderr: int | IO[Any] | None,
+        kill_timeout: float | None = None,
         **kwargs: Any,
     ) -> Process:
         await cls.checkpoint()
@@ -2865,6 +2878,7 @@ class AsyncIOBackend(AsyncBackend):
             stderr_stream,
             protocol.exited,
             transport,
+            kill_timeout,
         )
 
     @classmethod

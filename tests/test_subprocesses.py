@@ -21,6 +21,7 @@ from anyio import (
     fail_after,
     open_process,
     run_process,
+    sleep_forever,
 )
 from anyio._core._eventloop import get_async_backend
 from anyio.streams.buffered import BufferedByteReceiveStream
@@ -50,6 +51,13 @@ async def test_run_process(
     process = await run_process(command, input=b"abc")
     assert process.returncode == 0
     assert process.stdout.rstrip() == b"cba"
+
+
+async def test_run_process_with_kill_timeout() -> None:
+    result = await run_process(
+        [sys.executable, "-c", "print('done')"], kill_timeout=0.5
+    )
+    assert result.stdout == b"done" + os.linesep.encode()
 
 
 async def test_run_process_checked() -> None:
@@ -287,6 +295,44 @@ async def test_process_aexit_cancellation_closes_standard_streams() -> None:
 
     with pytest.raises(ClosedResourceError):
         await process.stderr.receive(1)
+
+
+@pytest.mark.timeout(5)
+async def test_unreapable_process_cleanup_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = await open_process(
+        [sys.executable, "-c", "import time; time.sleep(10)"],
+        stdin=DEVNULL,
+        stdout=DEVNULL,
+        stderr=DEVNULL,
+        kill_timeout=0.05,
+    )
+    actual_wait = process.wait
+
+    async def stuck_wait() -> int:
+        await sleep_forever()
+        return 0
+
+    monkeypatch.setattr(process, "wait", stuck_wait)
+    try:
+        with pytest.raises(TimeoutError, match="did not exit"):
+            with CancelScope() as scope:
+                async with process:
+                    scope.cancel()
+    finally:
+        monkeypatch.setattr(process, "wait", actual_wait)
+        if process.returncode is None:
+            process.kill()
+
+        with fail_after(5, shield=True):
+            await process.wait()
+
+
+@pytest.mark.parametrize("kill_timeout", [0, -1, float("inf"), float("nan")])
+async def test_invalid_process_kill_timeout(kill_timeout: float) -> None:
+    with pytest.raises(ValueError, match="kill_timeout"):
+        await open_process([sys.executable, "-c", ""], kill_timeout=kill_timeout)
 
 
 async def test_exceptions_after_subprocess_closes_standard_streams() -> None:

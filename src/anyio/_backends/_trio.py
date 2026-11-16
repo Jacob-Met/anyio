@@ -81,7 +81,7 @@ from .._core._synchronization import (
 )
 from .._core._synchronization import Semaphore as BaseSemaphore
 from .._core._tasks import CancelScope as BaseCancelScope
-from .._core._tasks import TaskHandle
+from .._core._tasks import TaskHandle, fail_after
 from ..abc import IPSockAddrType, UDPPacketType, UNIXDatagramPacketType
 from ..abc._eventloop import AsyncBackend, StrOrBytesPath
 from ..abc._tasks import T_contra, call_for_coroutine, get_callable_name, get_coro_name
@@ -364,6 +364,7 @@ class Process(abc.Process):
     _stdin: abc.ByteSendStream | None
     _stdout: abc.ByteReceiveStream | None
     _stderr: abc.ByteReceiveStream | None
+    _kill_timeout: float | None = None
 
     async def aclose(self) -> None:
         with CancelScope(shield=True):
@@ -379,7 +380,18 @@ class Process(abc.Process):
         except BaseException:
             self.kill()
             with CancelScope(shield=True):
-                await self.wait()
+                if self._kill_timeout is None:
+                    await self.wait()
+                else:
+                    with fail_after(
+                        self._kill_timeout,
+                        reason=(
+                            f"process {self.pid} did not exit within "
+                            f"{self._kill_timeout} seconds after kill"
+                        ),
+                    ):
+                        await self.wait()
+
             raise
 
     async def wait(self) -> int:
@@ -1253,6 +1265,7 @@ class TrioBackend(AsyncBackend):
         stdin: int | IO[Any] | None,
         stdout: int | IO[Any] | None,
         stderr: int | IO[Any] | None,
+        kill_timeout: float | None = None,
         **kwargs: Any,
     ) -> Process:
         def convert_item(item: StrOrBytesPath) -> str:
@@ -1284,7 +1297,9 @@ class TrioBackend(AsyncBackend):
         stdin_stream = SendStreamWrapper(process.stdin) if process.stdin else None
         stdout_stream = ReceiveStreamWrapper(process.stdout) if process.stdout else None
         stderr_stream = ReceiveStreamWrapper(process.stderr) if process.stderr else None
-        return Process(process, stdin_stream, stdout_stream, stderr_stream)
+        return Process(
+            process, stdin_stream, stdout_stream, stderr_stream, kill_timeout
+        )
 
     @classmethod
     def setup_process_pool_exit_at_shutdown(cls, workers: set[abc.Process]) -> None:

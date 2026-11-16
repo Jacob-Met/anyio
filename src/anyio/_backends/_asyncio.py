@@ -2531,7 +2531,7 @@ class TestRunner(abc.TestRunner):
                     self._active_fixture_generators[:]
                 ):
                     if fixture_scope is None or not fixture_scope.cancel_called:
-                        continue
+                        break
 
                     self._active_fixture_generators.remove((asyncgen, fixture_scope))
                     try:

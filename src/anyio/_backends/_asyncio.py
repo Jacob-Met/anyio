@@ -2549,7 +2549,10 @@ class TestRunner(abc.TestRunner):
         return retval
 
     def run_test(
-        self, test_func: Callable[..., Coroutine[Any, Any, Any]], kwargs: dict[str, Any]
+        self,
+        test_func: Callable[..., Coroutine[Any, Any, Any]],
+        kwargs: dict[str, Any],
+        fixture_ids: frozenset[object] | None = None,
     ) -> None:
         from _pytest.outcomes import OutcomeException
 
@@ -2614,7 +2617,10 @@ class TestRunner(abc.TestRunner):
                         pass
                     except BaseException as exc:
                         self._mark_failed_fixture(fixture_id, exc)
-                        self._exceptions.append(exc)
+                        if fixture_ids is None or fixture_id in fixture_ids:
+                            self._exceptions.append(exc)
+                        else:
+                            self._mark_unreported_fixture_error(fixture_id, exc)
 
         # The failure of a fixture's child task can cancel an outer fixture
         # while a later fixture is still alive. Surface the original exception
@@ -2627,7 +2633,13 @@ class TestRunner(abc.TestRunner):
             group = group_ref() if group_ref is not None else None
             if group is not None and group._exceptions:
                 self._mark_failed_fixture(fixture_id, group._exceptions[0])
-                self._exceptions.extend(group._exceptions)
+                if fixture_ids is None or fixture_id in fixture_ids:
+                    self._exceptions.extend(group._exceptions)
+                else:
+                    self._mark_unreported_fixture_error(
+                        fixture_id, group._exceptions[0]
+                    )
+
                 group._exceptions.clear()
 
         self._raise_async_exceptions()

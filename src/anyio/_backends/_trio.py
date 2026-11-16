@@ -1109,6 +1109,13 @@ class TestRunner(abc.TestRunner):
             if fixture_scope is None or not fixture_scope.cancel_called:
                 break
 
+            # Explicit cancellation of a fixture task group is not a child
+            # failure. Closing the fixture here would also close resources
+            # that later tests in the same scope still need.
+            reason = getattr(fixture_scope, "_cancel_reason", None)
+            if getattr(reason, "source", None) != "nursery":
+                break
+
             # A canceled outer nursery can propagate cancellation into
             # independent inner fixtures. They must remain nested until
             # pytest's normal teardown; forcing either scope closed now

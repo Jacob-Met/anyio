@@ -2358,6 +2358,7 @@ class TestRunner(abc.TestRunner):
         use_uvloop: bool = False,
         loop_factory: Callable[[], AbstractEventLoop] | None = None,
     ) -> None:
+        super().__init__()
         if use_uvloop and loop_factory is None:
             if sys.platform != "win32":
                 import uvloop
@@ -2372,7 +2373,7 @@ class TestRunner(abc.TestRunner):
         self._exceptions: list[BaseException] = []
         self._runner_task: asyncio.Task | None = None
         self._active_fixture_generators: list[
-            tuple[AsyncGenerator[Any, Any], CancelScope | None]
+            tuple[AsyncGenerator[Any, Any], CancelScope | None, object | None]
         ] = []
 
     def __enter__(self) -> Self:
@@ -2474,6 +2475,7 @@ class TestRunner(abc.TestRunner):
         self,
         fixture_func: Callable[..., AsyncGenerator[T_Retval, Any]],
         kwargs: dict[str, Any],
+        fixture_id: object | None = None,
     ) -> Iterable[T_Retval]:
         original_asyncgen = fixture_func(**kwargs)
         fixture_scope: list[CancelScope | None] = [None]
@@ -2505,7 +2507,8 @@ class TestRunner(abc.TestRunner):
         )
         self._raise_async_exceptions()
 
-        fixture_entry = (asyncgen, fixture_scope[0])
+        fixture_entry = (asyncgen, fixture_scope[0], fixture_id)
+        self._clear_failed_fixture(fixture_id)
         self._active_fixture_generators.append(fixture_entry)
         try:
             yield fixturevalue
@@ -2522,6 +2525,8 @@ class TestRunner(abc.TestRunner):
         finally:
             if fixture_entry in self._active_fixture_generators:
                 self._active_fixture_generators.remove(fixture_entry)
+
+            self._clear_failed_fixture(fixture_id)
 
     def run_fixture(
         self,
@@ -2592,13 +2597,15 @@ class TestRunner(abc.TestRunner):
                 cancelled_parent |= cursor.cancel_called
                 cursor = cursor._parent_scope
             if cancelled_parent:
-                for asyncgen, fixture_scope in reversed(
+                for asyncgen, fixture_scope, fixture_id in reversed(
                     self._active_fixture_generators[:]
                 ):
                     if fixture_scope is None or not fixture_scope.cancel_called:
                         break
 
-                    self._active_fixture_generators.remove((asyncgen, fixture_scope))
+                    self._active_fixture_generators.remove(
+                        (asyncgen, fixture_scope, fixture_id)
+                    )
                     try:
                         self.get_loop().run_until_complete(
                             self._call_in_runner_task(asyncgen.asend, None)
@@ -2606,18 +2613,20 @@ class TestRunner(abc.TestRunner):
                     except StopAsyncIteration:
                         pass
                     except BaseException as exc:
+                        self._mark_failed_fixture(fixture_id, exc)
                         self._exceptions.append(exc)
 
         # The failure of a fixture's child task can cancel an outer fixture
         # while a later fixture is still alive. Surface the original exception
         # against this test without tearing down the nested fixture out of order.
-        for _, fixture_scope in self._active_fixture_generators:
+        for _, fixture_scope, fixture_id in self._active_fixture_generators:
             if fixture_scope is None or not fixture_scope.cancel_called:
                 continue
 
             group_ref = fixture_scope._task_group
             group = group_ref() if group_ref is not None else None
             if group is not None and group._exceptions:
+                self._mark_failed_fixture(fixture_id, group._exceptions[0])
                 self._exceptions.extend(group._exceptions)
                 group._exceptions.clear()
 

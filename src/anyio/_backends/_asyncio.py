@@ -5,6 +5,7 @@ import asyncio
 import concurrent.futures
 import math
 import os
+import signal
 import socket
 import sys
 import threading
@@ -2254,6 +2255,7 @@ class _SignalReceiver:
         self._signal_queue: deque[Signals] = deque()
         self._future: asyncio.Future = asyncio.Future()
         self._handled_signals: set[Signals] = set()
+        self._previous_handlers: dict[Signals, Any] = {}
 
     def _deliver(self, signum: Signals) -> None:
         self._signal_queue.append(signum)
@@ -2261,9 +2263,15 @@ class _SignalReceiver:
             self._future.set_result(None)
 
     def __enter__(self) -> Self:
-        for sig in set(self._signals):
-            self._loop.add_signal_handler(sig, self._deliver, sig)
-            self._handled_signals.add(sig)
+        try:
+            for sig in dict.fromkeys(self._signals):
+                previous = signal.getsignal(sig)
+                self._loop.add_signal_handler(sig, self._deliver, sig)
+                self._previous_handlers[sig] = previous
+                self._handled_signals.add(sig)
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
 
         return self
 
@@ -2275,6 +2283,13 @@ class _SignalReceiver:
     ) -> None:
         for sig in self._handled_signals:
             self._loop.remove_signal_handler(sig)
+            previous = self._previous_handlers[sig]
+            # asyncio's no-op handler has no public path back to its callback.
+            if getattr(previous, "__name__", None) != "_sighandler_noop":
+                signal.signal(sig, previous)
+
+        self._handled_signals.clear()
+        self._previous_handlers.clear()
 
     def __aiter__(self) -> _SignalReceiver:
         return self

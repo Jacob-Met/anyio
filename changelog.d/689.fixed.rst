@@ -1,1 +1,1 @@
-Fixed restoration of Python signal handlers after signal receiving on asyncio.
+Fixed signal receiver scopes replacing existing asyncio and Python signal handlers.

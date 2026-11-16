@@ -1052,10 +1052,11 @@ class TestRunner(abc.TestRunner):
         fixture_scope: list[trio.CancelScope | None] = [None]
 
         async def recovered_fixture() -> AsyncGenerator[T_Retval, Any]:
+            needs_shield = bool(self._active_fixture_generators) or (
+                trio.current_effective_deadline() == -math.inf
+            )
             recovery_scope = (
-                trio.CancelScope(shield=True)
-                if trio.current_effective_deadline() == -math.inf
-                else nullcontext()
+                trio.CancelScope(shield=True) if needs_shield else nullcontext()
             )
             # The shield must stay active across both halves of an async fixture.
             with recovery_scope:
@@ -1153,6 +1154,37 @@ class TestRunner(abc.TestRunner):
                 # Let pending fixture children run once without turning an
                 # unrelated successful test into a second cancellation error.
                 await trio.lowlevel.cancel_shielded_checkpoint()
+
+                # A failed outer fixture cannot be unwound while a healthy
+                # inner fixture still owns a nursery. Report its pending child
+                # exception now, preserving the normal teardown nesting.
+                scopes = {
+                    scope
+                    for _, scope in self._active_fixture_generators
+                    if scope is not None and scope.cancel_called
+                }
+                errors: list[BaseException] = []
+                for nursery in trio.lowlevel.current_task().child_nurseries:
+                    if nursery.cancel_scope not in scopes:
+                        continue
+
+                    reason = getattr(nursery.cancel_scope, "_cancel_reason", None)
+                    if getattr(reason, "source", None) != "nursery":
+                        continue
+
+                    pending = [
+                        exc
+                        for exc in nursery._pending_excs
+                        if not isinstance(exc, trio.Cancelled)
+                    ]
+                    errors.extend(pending)
+                    for exc in pending:
+                        nursery._pending_excs.remove(exc)
+
+                if len(errors) == 1:
+                    raise errors[0]
+                elif errors:
+                    raise BaseExceptionGroup("Failed async fixtures", errors)
 
         try:
             self._call_in_runner_task(run_test_in_runner_task)

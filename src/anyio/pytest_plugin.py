@@ -8,7 +8,7 @@ from inspect import isasyncgenfunction, iscoroutinefunction, ismethod
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
-from _pytest.fixtures import FuncFixtureInfo, SubRequest
+from _pytest.fixtures import FixtureDef, FuncFixtureInfo, SubRequest
 from _pytest.outcomes import Exit
 from _pytest.scope import Scope
 
@@ -159,7 +159,9 @@ def pytest_fixture_setup(fixturedef: Any, request: Any) -> Generator[Any]:
                 )
 
             if isasyncgenfunction(local_func):
-                yield from runner.run_asyncgen_fixture(local_func, kwargs)
+                yield from runner.run_asyncgen_fixture(
+                    local_func, kwargs, fixture_id=fixturedef
+                )
             else:
                 yield runner.run_fixture(local_func, kwargs)
 
@@ -184,6 +186,20 @@ def pytest_fixture_setup(fixturedef: Any, request: Any) -> Generator[Any]:
                 fixturedef.argnames = original_argname
 
     return (yield)
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_setup(item: pytest.Item) -> Generator[None]:
+    yield
+    if _current_runner is None or not isinstance(item, pytest.Function):
+        return
+
+    failed = _current_runner.failed_fixture(item._request._fixture_defs.values())
+    if failed is not None:
+        fixturedef, error = failed
+        raise RuntimeError(
+            f"Async fixture {cast(FixtureDef[Any], fixturedef).argname!r} failed in an earlier test"
+        ) from error
 
 
 @pytest.hookimpl(tryfirst=True)

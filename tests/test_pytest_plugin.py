@@ -1160,6 +1160,7 @@ def test_failed_outer_module_fixture_preserves_nested_fixture_scope(
             "-m",
             "pytest",
             "-q",
+            "-rA",
             "--tb=short",
             "-p",
             "anyio",
@@ -1176,9 +1177,73 @@ def test_failed_outer_module_fixture_preserves_nested_fixture_scope(
         timeout=8,
         check=False,
     )
-    assert "REVERSED_BROKEN" in result.stdout
-    assert "2 passed" in result.stdout
+    assert "PASSED " in result.stdout and "::test_unrelated" in result.stdout
+    assert "1 error" in result.stdout or "1 failed" in result.stdout
     assert "UNRELATED_HEALTHY_CLOSED" not in result.stdout
     assert "Attempted to exit a cancel scope" not in result.stdout
     assert "Cancel scope stack corrupted" not in result.stdout
     assert "Nursery stack corrupted" not in result.stdout
+
+
+@pytest.mark.parametrize("backend", get_available_backends())
+def test_intentional_module_task_group_cancel_keeps_fixture(
+    testdir: Pytester, backend: str
+) -> None:
+    """An explicit cancel must not eagerly tear down a module-scoped fixture."""
+    import os
+    import subprocess
+    import sys
+
+    test_file = testdir.makepyfile(
+        f"""
+        import anyio
+        import pytest
+
+        @pytest.fixture(scope="module")
+        def anyio_backend():
+            return {backend!r}
+
+        @pytest.fixture(scope="module")
+        async def service():
+            state = {{"closed": False}}
+            async with anyio.create_task_group() as task_group:
+                task_group.start_soon(anyio.sleep_forever)
+                state["group"] = task_group
+                yield state
+                state["closed"] = True
+
+        @pytest.mark.anyio
+        async def test_cancel(service):
+            service["group"].cancel_scope.cancel()
+            await anyio.sleep(0)
+
+        @pytest.mark.anyio
+        async def test_unrelated(service):
+            assert not service["closed"], "PREMATURE_FIXTURE_CLOSE"
+        """
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-rA",
+            "--tb=short",
+            "-p",
+            "anyio",
+            "-p",
+            "no:asyncio",
+            "-p",
+            "no:trio",
+            str(test_file),
+        ],
+        cwd=os.path.dirname(str(test_file)),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=8,
+        check=False,
+    )
+    assert "PASSED " in result.stdout and "::test_unrelated" in result.stdout
+    assert "PREMATURE_FIXTURE_CLOSE" not in result.stdout

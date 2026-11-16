@@ -96,6 +96,65 @@ def test_plugin(testdir: Pytester) -> None:
     )
 
 
+@pytest.mark.parametrize("backend", ("asyncio", "trio"))
+@pytest.mark.parametrize("fixture_scope", ("function", "module"))
+@pytest.mark.parametrize("later_fixture_kind", ("asyncgen", "coroutine"))
+def test_crashed_fixture_does_not_poison_later_tests(
+    testdir: Pytester, backend: str, fixture_scope: str, later_fixture_kind: str
+) -> None:
+    # A background child crashing must not kill the persistent test runner (#805).
+    later_fixture_body = (
+        "yield 42\n            await anyio.sleep(0)"
+        if later_fixture_kind == "asyncgen"
+        else "return 42"
+    )
+    testdir.makepyfile(
+        f"""
+        import anyio
+        import pytest
+
+        @pytest.fixture(scope="{fixture_scope}")
+        def anyio_backend():
+            return "{backend}"
+
+        @pytest.fixture(scope="{fixture_scope}")
+        async def crashing_fixture():
+            trigger = anyio.Event()
+
+            async def background(*, task_status):
+                task_status.started()
+                await trigger.wait()
+                raise RuntimeError("background fixture failure #805")
+
+            async with anyio.create_task_group() as group:
+                await group.start(background)
+                yield trigger
+
+        @pytest.fixture
+        async def unrelated_fixture():
+            await anyio.sleep(0)
+            {later_fixture_body}
+
+        @pytest.mark.anyio
+        async def test_trigger_background_failure(crashing_fixture):
+            crashing_fixture.set()
+            await anyio.sleep(0)
+
+        @pytest.mark.anyio
+        async def test_unrelated(unrelated_fixture):
+            assert unrelated_fixture == 42
+        """
+    )
+
+    result = testdir.runpytest_subprocess(*pytest_args, timeout=10)
+    output = result.stdout.str()
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    assert "RuntimeError: background fixture failure #805" in output
+    assert "test_unrelated PASSED" in output
+    assert "ClosedResourceError" not in output
+    assert "was never awaited" not in output
+
+
 def test_asyncio(testdir: Pytester, caplog: LogCaptureFixture) -> None:
     testdir.makeconftest(
         """

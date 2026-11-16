@@ -1180,6 +1180,8 @@ def test_failed_outer_module_fixture_preserves_nested_fixture_scope(
     assert "PASSED " in result.stdout and "::test_unrelated" in result.stdout
     assert "1 error" in result.stdout or "1 failed" in result.stdout
     assert "UNRELATED_HEALTHY_CLOSED" not in result.stdout
+    assert "REVERSED_BROKEN" in result.stdout
+    assert "ERROR at teardown of test_unrelated" not in result.stdout
     assert "Attempted to exit a cancel scope" not in result.stdout
     assert "Cancel scope stack corrupted" not in result.stdout
     assert "Nursery stack corrupted" not in result.stdout

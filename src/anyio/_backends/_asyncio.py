@@ -209,6 +209,7 @@ class CancelScope(BaseCancelScope):
         "_parent_scope",
         "_pending_uncancellations",
         "_shield",
+        "_task_group",
         "_tasks",
         "_timeout_handle",
     )
@@ -222,6 +223,7 @@ class CancelScope(BaseCancelScope):
 
         self._deadline = deadline
         self._shield = shield
+        self._task_group: weakref.ReferenceType[TaskGroup] | None = None
         self._parent_scope: CancelScope | None = None
         self._child_scopes: set[CancelScope] = set()
         self._cancel_called = False
@@ -618,6 +620,7 @@ else:
 class TaskGroup(abc.TaskGroup):
     def __init__(self) -> None:
         self.cancel_scope: CancelScope = CancelScope()
+        self.cancel_scope._task_group = weakref.ref(self)
         self._entered = False
         self._exceptions: list[BaseException] = []
         self._tasks: set[asyncio.Task] = set()
@@ -2415,11 +2418,10 @@ class TestRunner(abc.TestRunner):
         async def recovered_fixture() -> AsyncGenerator[T_Retval, Any]:
             task_state = _task_states.get(cast(asyncio.Task, current_task()))
             scope = task_state.cancel_scope if task_state else None
-            recovery_scope = (
-                CancelScope(shield=True)
-                if scope is not None and scope._effectively_cancelled
-                else nullcontext()
+            needs_shield = bool(self._active_fixture_generators) or (
+                scope is not None and scope._effectively_cancelled
             )
+            recovery_scope = CancelScope(shield=True) if needs_shield else nullcontext()
             # The shield must stay active across both halves of an async fixture.
             with recovery_scope:
                 try:
@@ -2542,6 +2544,19 @@ class TestRunner(abc.TestRunner):
                         pass
                     except BaseException as exc:
                         self._exceptions.append(exc)
+
+        # The failure of a fixture's child task can cancel an outer fixture
+        # while a later fixture is still alive. Surface the original exception
+        # against this test without tearing down the nested fixture out of order.
+        for _, fixture_scope in self._active_fixture_generators:
+            if fixture_scope is None or not fixture_scope.cancel_called:
+                continue
+
+            group_ref = fixture_scope._task_group
+            group = group_ref() if group_ref is not None else None
+            if group is not None and group._exceptions:
+                self._exceptions.extend(group._exceptions)
+                group._exceptions.clear()
 
         self._raise_async_exceptions()
 

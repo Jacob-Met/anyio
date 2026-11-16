@@ -1101,6 +1101,44 @@ class TestRunner(abc.TestRunner):
 
         return self._call_in_runner_task(run_fixture_in_runner_task)
 
+    def _recover_failed_fixtures(self) -> None:
+        errors: list[BaseException] = []
+        active_fixtures = self._active_fixture_generators[:]
+        for index in range(len(active_fixtures) - 1, -1, -1):
+            asyncgen, fixture_scope = active_fixtures[index]
+            if fixture_scope is None or not fixture_scope.cancel_called:
+                break
+
+            # Explicit cancellation of a fixture task group is not a child
+            # failure. Closing the fixture here would also close resources
+            # that later tests in the same scope still need.
+            reason = getattr(fixture_scope, "_cancel_reason", None)
+            if getattr(reason, "source", None) != "nursery":
+                break
+
+            # A canceled outer nursery can propagate cancellation into
+            # independent inner fixtures. They must remain nested until
+            # pytest's normal teardown; forcing either scope closed now
+            # corrupts the nursery stack or kills an unrelated fixture.
+            if any(
+                outer_scope is not None and outer_scope.cancel_called
+                for _, outer_scope in active_fixtures[:index]
+            ):
+                break
+
+            self._active_fixture_generators.remove((asyncgen, fixture_scope))
+            try:
+                self._call_in_runner_task(asyncgen.asend, None)
+            except StopAsyncIteration:
+                pass
+            except BaseException as exc:
+                errors.append(exc)
+
+        if len(errors) == 1:
+            raise errors[0] from None
+        elif errors:
+            raise BaseExceptionGroup("Failed async fixtures", errors) from None
+
     def run_test(
         self, test_func: Callable[..., Coroutine[Any, Any, Any]], kwargs: dict[str, Any]
     ) -> None:
@@ -1112,33 +1150,17 @@ class TestRunner(abc.TestRunner):
                 await test_func(**kwargs)
 
             if self._active_fixture_generators:
-                await trio.lowlevel.checkpoint()
+                # Let pending fixture children run once without turning an
+                # unrelated successful test into a second cancellation error.
+                await trio.lowlevel.cancel_shielded_checkpoint()
 
         try:
             self._call_in_runner_task(run_test_in_runner_task)
         except trio.Cancelled:
-            # A child failure in an upper-scoped fixture cancels the host.
-            # Surface the fixture's original failure with the triggering test,
-            # rather than at an unrelated test's much later teardown.
-            errors: list[BaseException] = []
-            for asyncgen, fixture_scope in reversed(self._active_fixture_generators[:]):
-                if fixture_scope is None or not fixture_scope.cancel_called:
-                    continue
-
-                self._active_fixture_generators.remove((asyncgen, fixture_scope))
-                try:
-                    self._call_in_runner_task(asyncgen.asend, None)
-                except StopAsyncIteration:
-                    pass
-                except BaseException as exc:
-                    errors.append(exc)
-
-            if len(errors) == 1:
-                raise errors[0] from None
-            elif errors:
-                raise BaseExceptionGroup("Failed async fixtures", errors) from None
-
+            self._recover_failed_fixtures()
             raise
+        else:
+            self._recover_failed_fixtures()
 
 
 class TrioTaskInfo(TaskInfo):

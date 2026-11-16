@@ -1,0 +1,1 @@
+Fixed signal receivers removing previously installed handlers on asyncio.

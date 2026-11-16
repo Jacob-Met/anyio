@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import socket
-from collections.abc import Callable, Generator, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator
 from contextlib import ExitStack, contextmanager
 from inspect import isasyncgenfunction, iscoroutinefunction, ismethod
 from typing import TYPE_CHECKING, Any, cast
@@ -188,18 +188,32 @@ def pytest_fixture_setup(fixturedef: Any, request: Any) -> Generator[Any]:
     return (yield)
 
 
-@pytest.hookimpl(wrapper=True)
-def pytest_runtest_setup(item: pytest.Item) -> Generator[None]:
-    yield
-    if _current_runner is None or not isinstance(item, pytest.Function):
+def _reject_failed_fixture_dependencies(fixturedefs: Iterable[object]) -> None:
+    if _current_runner is None:
         return
 
-    failed = _current_runner.failed_fixture(item._request._fixture_defs.values())
+    failed = _current_runner.failed_fixture(fixturedefs)
     if failed is not None:
         fixturedef, error = failed
         raise RuntimeError(
             f"Async fixture {cast(FixtureDef[Any], fixturedef).argname!r} failed in an earlier test"
         ) from error
+
+
+@pytest.hookimpl(specname="pytest_fixture_setup", tryfirst=True)
+def pytest_reject_failed_fixture_dependencies(
+    fixturedef: FixtureDef[Any], request: SubRequest
+) -> None:
+    # Block setup of a dependent fixture before it executes side effects.
+    _reject_failed_fixture_dependencies(request._fixture_defs.values())
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_setup(item: pytest.Item) -> Generator[None]:
+    yield
+    if isinstance(item, pytest.Function):
+        # Cached fixtures do not call pytest_fixture_setup again.
+        _reject_failed_fixture_dependencies(item._request._fixture_defs.values())
 
 
 @pytest.hookimpl(tryfirst=True)

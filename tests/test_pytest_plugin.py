@@ -1188,6 +1188,54 @@ def test_failed_outer_module_fixture_preserves_nested_fixture_scope(
 
 
 @pytest.mark.parametrize("backend", get_available_backends())
+def test_broken_module_fixture_does_not_serve_later_dependent_test(
+    testdir: Pytester, backend: str
+) -> None:
+    testdir.makepyfile(
+        f"""
+        import anyio
+        import pytest
+
+        @pytest.fixture(scope="module")
+        def anyio_backend():
+            return {backend!r}
+
+        @pytest.fixture(scope="module")
+        async def shared_service():
+            trigger = anyio.Event()
+
+            async def crash():
+                await trigger.wait()
+                raise RuntimeError("SHARED_WORKER_DIED")
+
+            async with anyio.create_task_group() as group:
+                group.start_soon(crash)
+                yield trigger
+
+        @pytest.mark.anyio
+        async def test_break_service(shared_service):
+            shared_service.set()
+            await anyio.sleep(0)
+
+        @pytest.mark.anyio
+        async def test_reuses_broken_service(shared_service):
+            print("RAN_WITH_DEAD_SERVICE")
+
+        @pytest.mark.anyio
+        async def test_unrelated():
+            assert True
+        """
+    )
+
+    result = testdir.runpytest_subprocess(*pytest_args, "-s", "--tb=short", timeout=10)
+    result.assert_outcomes(failed=1, errors=1, passed=1)
+    output = result.stdout.str()
+    assert "SHARED_WORKER_DIED" in output
+    assert "RAN_WITH_DEAD_SERVICE" not in output
+    assert "test_unrelated PASSED" in output
+
+
+@pytest.mark.parametrize("backend", get_available_backends())
 def test_intentional_module_task_group_cancel_keeps_fixture(
     testdir: Pytester, backend: str
 ) -> None:

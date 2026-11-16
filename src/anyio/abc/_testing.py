@@ -14,6 +14,28 @@ class TestRunner(metaclass=ABCMeta):
     same event loop.
     """
 
+    def __init__(self) -> None:
+        self._failed_fixtures: dict[object, BaseException] = {}
+
+    def _mark_failed_fixture(
+        self, fixture_id: object | None, error: BaseException
+    ) -> None:
+        if fixture_id is not None:
+            self._failed_fixtures.setdefault(fixture_id, error)
+
+    def _clear_failed_fixture(self, fixture_id: object | None) -> None:
+        if fixture_id is not None:
+            self._failed_fixtures.pop(fixture_id, None)
+
+    def failed_fixture(
+        self, fixture_ids: Iterable[object]
+    ) -> tuple[object, BaseException] | None:
+        for fixture_id in fixture_ids:
+            if error := self._failed_fixtures.get(fixture_id):
+                return fixture_id, error
+
+        return None
+
     def __enter__(self) -> Self:
         return self
 
@@ -30,12 +52,14 @@ class TestRunner(metaclass=ABCMeta):
         self,
         fixture_func: Callable[..., AsyncGenerator[_T, Any]],
         kwargs: dict[str, Any],
+        fixture_id: object | None = None,
     ) -> Iterable[_T]:
         """
         Run an async generator fixture.
 
         :param fixture_func: the fixture function
         :param kwargs: keyword arguments to call the fixture function with
+        :param fixture_id: identity used to track a failed persistent fixture
         :return: an iterator yielding the value yielded from the async generator
         """
 

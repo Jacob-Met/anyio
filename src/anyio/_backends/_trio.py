@@ -972,6 +972,7 @@ class _SignalReceiver:
 
 class TestRunner(abc.TestRunner):
     def __init__(self, **options: Any) -> None:
+        super().__init__()
         from queue import Queue
 
         self._call_queue: Queue[Callable[[], object]] = Queue()
@@ -980,7 +981,7 @@ class TestRunner(abc.TestRunner):
         ) = None
         self._options = options
         self._active_fixture_generators: list[
-            tuple[AsyncGenerator[Any, Any], trio.CancelScope | None]
+            tuple[AsyncGenerator[Any, Any], trio.CancelScope | None, object | None]
         ] = []
 
     def __exit__(
@@ -1047,6 +1048,7 @@ class TestRunner(abc.TestRunner):
         self,
         fixture_func: Callable[..., AsyncGenerator[T_Retval, Any]],
         kwargs: dict[str, Any],
+        fixture_id: object | None = None,
     ) -> Iterable[T_Retval]:
         original_asyncgen = fixture_func(**kwargs)
         fixture_scope: list[trio.CancelScope | None] = [None]
@@ -1072,7 +1074,8 @@ class TestRunner(abc.TestRunner):
         asyncgen = recovered_fixture()
         fixturevalue: T_Retval = self._call_in_runner_task(asyncgen.asend, None)
 
-        fixture_entry = (asyncgen, fixture_scope[0])
+        fixture_entry = (asyncgen, fixture_scope[0], fixture_id)
+        self._clear_failed_fixture(fixture_id)
         self._active_fixture_generators.append(fixture_entry)
         try:
             yield fixturevalue
@@ -1087,6 +1090,8 @@ class TestRunner(abc.TestRunner):
         finally:
             if fixture_entry in self._active_fixture_generators:
                 self._active_fixture_generators.remove(fixture_entry)
+
+            self._clear_failed_fixture(fixture_id)
 
     def run_fixture(
         self,
@@ -1106,7 +1111,7 @@ class TestRunner(abc.TestRunner):
         errors: list[BaseException] = []
         active_fixtures = self._active_fixture_generators[:]
         for index in range(len(active_fixtures) - 1, -1, -1):
-            asyncgen, fixture_scope = active_fixtures[index]
+            asyncgen, fixture_scope, fixture_id = active_fixtures[index]
             if fixture_scope is None or not fixture_scope.cancel_called:
                 break
 
@@ -1123,16 +1128,19 @@ class TestRunner(abc.TestRunner):
             # corrupts the nursery stack or kills an unrelated fixture.
             if any(
                 outer_scope is not None and outer_scope.cancel_called
-                for _, outer_scope in active_fixtures[:index]
+                for _, outer_scope, _ in active_fixtures[:index]
             ):
                 break
 
-            self._active_fixture_generators.remove((asyncgen, fixture_scope))
+            self._active_fixture_generators.remove(
+                (asyncgen, fixture_scope, fixture_id)
+            )
             try:
                 self._call_in_runner_task(asyncgen.asend, None)
             except StopAsyncIteration:
                 pass
             except BaseException as exc:
+                self._mark_failed_fixture(fixture_id, exc)
                 errors.append(exc)
 
         if len(errors) == 1:
@@ -1159,8 +1167,8 @@ class TestRunner(abc.TestRunner):
                 # inner fixture still owns a nursery. Report its pending child
                 # exception now, preserving the normal teardown nesting.
                 scopes = {
-                    scope
-                    for _, scope in self._active_fixture_generators
+                    scope: fixture_id
+                    for _, scope, fixture_id in self._active_fixture_generators
                     if scope is not None and scope.cancel_called
                 }
                 errors: list[BaseException] = []
@@ -1177,7 +1185,12 @@ class TestRunner(abc.TestRunner):
                         for exc in nursery._pending_excs
                         if not isinstance(exc, trio.Cancelled)
                     ]
-                    errors.extend(pending)
+                    if pending:
+                        self._mark_failed_fixture(
+                            scopes[nursery.cancel_scope], pending[0]
+                        )
+                        errors.extend(pending)
+
                     for exc in pending:
                         nursery._pending_excs.remove(exc)
 

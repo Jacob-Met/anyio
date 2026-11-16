@@ -47,7 +47,7 @@ from queue import Empty, Queue
 from signal import Signals
 from socket import AddressFamily, SocketKind
 from threading import Thread
-from types import CodeType, TracebackType
+from types import CodeType, FrameType, TracebackType
 from typing import (
     IO,
     TYPE_CHECKING,
@@ -2254,7 +2254,6 @@ class _SignalReceiver:
         self._loop = get_running_loop()
         self._signal_queue: deque[Signals] = deque()
         self._future: asyncio.Future = asyncio.Future()
-        self._handled_signals: set[Signals] = set()
         self._previous_handlers: dict[Signals, Any] = {}
 
     def _deliver(self, signum: Signals) -> None:
@@ -2262,13 +2261,13 @@ class _SignalReceiver:
         if not self._future.done():
             self._future.set_result(None)
 
+    def _signal_handler(self, signum: int, frame: FrameType | None) -> None:
+        self._loop.call_soon_threadsafe(self._deliver, Signals(signum))
+
     def __enter__(self) -> Self:
         try:
             for sig in dict.fromkeys(self._signals):
-                previous = signal.getsignal(sig)
-                self._loop.add_signal_handler(sig, self._deliver, sig)
-                self._previous_handlers[sig] = previous
-                self._handled_signals.add(sig)
+                self._previous_handlers[sig] = signal.signal(sig, self._signal_handler)
         except BaseException:
             self.__exit__(None, None, None)
             raise
@@ -2281,14 +2280,9 @@ class _SignalReceiver:
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
-        for sig in self._handled_signals:
-            self._loop.remove_signal_handler(sig)
-            previous = self._previous_handlers[sig]
-            # asyncio's no-op handler has no public path back to its callback.
-            if getattr(previous, "__name__", None) != "_sighandler_noop":
-                signal.signal(sig, previous)
+        for sig, previous in self._previous_handlers.items():
+            signal.signal(sig, previous)
 
-        self._handled_signals.clear()
         self._previous_handlers.clear()
 
     def __aiter__(self) -> _SignalReceiver:

@@ -1217,8 +1217,14 @@ def test_broken_module_fixture_does_not_serve_later_dependent_test(
             shared_service.set()
             await anyio.sleep(0)
 
+        @pytest.fixture
+        async def dependent_service(shared_service):
+            print("UNEXPECTED_DEPENDENT_FIXTURE_SETUP")
+            await anyio.sleep(0)
+            return shared_service
+
         @pytest.mark.anyio
-        async def test_reuses_broken_service(shared_service):
+        async def test_reuses_broken_service(dependent_service):
             print("RAN_WITH_DEAD_SERVICE")
 
         @pytest.mark.anyio
@@ -1232,6 +1238,7 @@ def test_broken_module_fixture_does_not_serve_later_dependent_test(
     output = result.stdout.str()
     assert "SHARED_WORKER_DIED" in output
     assert "RAN_WITH_DEAD_SERVICE" not in output
+    assert "UNEXPECTED_DEPENDENT_FIXTURE_SETUP" not in output
     assert "test_unrelated PASSED" in output
 
 

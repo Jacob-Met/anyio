@@ -17,7 +17,7 @@ from collections.abc import (
     Iterable,
     Sequence,
 )
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from contextvars import Context, copy_context
 from dataclasses import dataclass
 from functools import partial, wraps
@@ -987,7 +987,13 @@ class TestRunner(abc.TestRunner):
             tuple[Awaitable[Any], list[Outcome]]
         ](1)
         with receive_stream:
-            async for awaitable, outcome_holder in receive_stream:
+            while True:
+                with trio.CancelScope(shield=True):
+                    try:
+                        awaitable, outcome_holder = await receive_stream.receive()
+                    except EndOfStream:
+                        break
+
                 try:
                     retval = await awaitable
                 except BaseException as exc:
@@ -1027,7 +1033,23 @@ class TestRunner(abc.TestRunner):
         fixture_func: Callable[..., AsyncGenerator[T_Retval, Any]],
         kwargs: dict[str, Any],
     ) -> Iterable[T_Retval]:
-        asyncgen = fixture_func(**kwargs)
+        original_asyncgen = fixture_func(**kwargs)
+
+        async def recovered_fixture() -> AsyncGenerator[T_Retval, Any]:
+            recovery_scope = (
+                trio.CancelScope(shield=True)
+                if trio.current_effective_deadline() == -math.inf
+                else nullcontext()
+            )
+            # The shield must stay active across both halves of an async fixture.
+            with recovery_scope:
+                try:
+                    async for value in original_asyncgen:
+                        yield value
+                finally:
+                    await original_asyncgen.aclose()
+
+        asyncgen = recovered_fixture()
         fixturevalue: T_Retval = self._call_in_runner_task(asyncgen.asend, None)
 
         yield fixturevalue
@@ -1045,12 +1067,26 @@ class TestRunner(abc.TestRunner):
         fixture_func: Callable[..., Coroutine[Any, Any, T_Retval]],
         kwargs: dict[str, Any],
     ) -> T_Retval:
-        return self._call_in_runner_task(fixture_func, **kwargs)
+        async def run_fixture_in_runner_task() -> T_Retval:
+            if trio.current_effective_deadline() == -math.inf:
+                with trio.CancelScope(shield=True):
+                    return await fixture_func(**kwargs)
+
+            return await fixture_func(**kwargs)
+
+        return self._call_in_runner_task(run_fixture_in_runner_task)
 
     def run_test(
         self, test_func: Callable[..., Coroutine[Any, Any, Any]], kwargs: dict[str, Any]
     ) -> None:
-        self._call_in_runner_task(test_func, **kwargs)
+        async def run_test_in_runner_task() -> None:
+            if trio.current_effective_deadline() == -math.inf:
+                with trio.CancelScope(shield=True):
+                    await test_func(**kwargs)
+            else:
+                await test_func(**kwargs)
+
+        self._call_in_runner_task(run_test_in_runner_task)
 
 
 class TrioTaskInfo(TaskInfo):

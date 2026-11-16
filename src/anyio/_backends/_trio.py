@@ -967,6 +967,9 @@ class TestRunner(abc.TestRunner):
             MemoryObjectSendStream[tuple[Awaitable[Any], list[Outcome]]] | None
         ) = None
         self._options = options
+        self._active_fixture_generators: list[
+            tuple[AsyncGenerator[Any, Any], trio.CancelScope | None]
+        ] = []
 
     def __exit__(
         self,
@@ -1034,6 +1037,7 @@ class TestRunner(abc.TestRunner):
         kwargs: dict[str, Any],
     ) -> Iterable[T_Retval]:
         original_asyncgen = fixture_func(**kwargs)
+        fixture_scope: list[trio.CancelScope | None] = [None]
 
         async def recovered_fixture() -> AsyncGenerator[T_Retval, Any]:
             recovery_scope = (
@@ -1045,6 +1049,9 @@ class TestRunner(abc.TestRunner):
             with recovery_scope:
                 try:
                     async for value in original_asyncgen:
+                        fixture_scope[0] = (
+                            trio.lowlevel.current_task()._cancel_status._scope
+                        )
                         yield value
                 finally:
                     await original_asyncgen.aclose()
@@ -1052,15 +1059,21 @@ class TestRunner(abc.TestRunner):
         asyncgen = recovered_fixture()
         fixturevalue: T_Retval = self._call_in_runner_task(asyncgen.asend, None)
 
-        yield fixturevalue
-
+        fixture_entry = (asyncgen, fixture_scope[0])
+        self._active_fixture_generators.append(fixture_entry)
         try:
-            self._call_in_runner_task(asyncgen.asend, None)
-        except StopAsyncIteration:
-            pass
-        else:
-            self._call_in_runner_task(asyncgen.aclose)
-            raise RuntimeError("Async generator fixture did not stop")
+            yield fixturevalue
+
+            try:
+                self._call_in_runner_task(asyncgen.asend, None)
+            except StopAsyncIteration:
+                pass
+            else:
+                self._call_in_runner_task(asyncgen.aclose)
+                raise RuntimeError("Async generator fixture did not stop")
+        finally:
+            if fixture_entry in self._active_fixture_generators:
+                self._active_fixture_generators.remove(fixture_entry)
 
     def run_fixture(
         self,
@@ -1086,7 +1099,34 @@ class TestRunner(abc.TestRunner):
             else:
                 await test_func(**kwargs)
 
-        self._call_in_runner_task(run_test_in_runner_task)
+            if self._active_fixture_generators:
+                await trio.lowlevel.checkpoint()
+
+        try:
+            self._call_in_runner_task(run_test_in_runner_task)
+        except trio.Cancelled:
+            # A child failure in an upper-scoped fixture cancels the host.
+            # Surface the fixture's original failure with the triggering test,
+            # rather than at an unrelated test's much later teardown.
+            errors: list[BaseException] = []
+            for asyncgen, fixture_scope in reversed(self._active_fixture_generators[:]):
+                if fixture_scope is None or not fixture_scope.cancel_called:
+                    continue
+
+                self._active_fixture_generators.remove((asyncgen, fixture_scope))
+                try:
+                    self._call_in_runner_task(asyncgen.asend, None)
+                except StopAsyncIteration:
+                    pass
+                except BaseException as exc:
+                    errors.append(exc)
+
+            if len(errors) == 1:
+                raise errors[0] from None
+            elif errors:
+                raise BaseExceptionGroup("Failed async fixtures", errors) from None
+
+            raise
 
 
 class TrioTaskInfo(TaskInfo):

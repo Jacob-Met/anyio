@@ -1023,6 +1023,7 @@ class TestBlockingPortal:
 
     @pytest.mark.parametrize("portal_backend_name", get_available_backends())
     @pytest.mark.usefixtures("deactivate_blockbuster")
+    @pytest.mark.timeout(4)
     async def test_from_async(
         self, anyio_backend_name: str, portal_backend_name: str
     ) -> None:
@@ -1034,9 +1035,6 @@ class TestBlockingPortal:
         https://github.com/agronholm/anyio/pull/524#discussion_r1183080886.
 
         """
-        if anyio_backend_name == "trio" and portal_backend_name == "trio":
-            pytest.xfail("known bug (#525)")
-
         with start_blocking_portal(portal_backend_name) as portal:
             portal.call(checkpoint)
 

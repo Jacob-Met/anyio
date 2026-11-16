@@ -1,0 +1,1 @@
+Fixed Trio-based blocking portals hanging when called from a running Trio task.

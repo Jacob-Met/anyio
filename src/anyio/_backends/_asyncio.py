@@ -31,7 +31,7 @@ from collections.abc import (
     Sequence,
 )
 from concurrent.futures import Future
-from contextlib import AbstractContextManager, suppress
+from contextlib import AbstractContextManager, nullcontext, suppress
 from contextvars import Context, copy_context
 from dataclasses import dataclass, field
 from functools import partial, wraps
@@ -2399,14 +2399,20 @@ class TestRunner(abc.TestRunner):
         from _pytest.outcomes import OutcomeException
 
         with receive_stream, self._send_stream:
-            async for coro, future in receive_stream:
+            while True:
+                with CancelScope(shield=True):
+                    try:
+                        coro, future = await receive_stream.receive()
+                    except EndOfStream:
+                        break
+
                 try:
                     retval = await coro
                 except CancelledError as exc:
                     if not future.cancelled():
                         future.cancel(*exc.args)
 
-                    raise
+                    # Keep the runner alive so cancelled fixtures can be torn down.
                 except BaseException as exc:
                     if not future.cancelled():
                         future.set_exception(exc)
@@ -2442,7 +2448,25 @@ class TestRunner(abc.TestRunner):
         fixture_func: Callable[..., AsyncGenerator[T_Retval, Any]],
         kwargs: dict[str, Any],
     ) -> Iterable[T_Retval]:
-        asyncgen = fixture_func(**kwargs)
+        original_asyncgen = fixture_func(**kwargs)
+
+        async def recovered_fixture() -> AsyncGenerator[T_Retval, Any]:
+            task_state = _task_states.get(cast(asyncio.Task, current_task()))
+            scope = task_state.cancel_scope if task_state else None
+            recovery_scope = (
+                CancelScope(shield=True)
+                if scope is not None and scope._effectively_cancelled
+                else nullcontext()
+            )
+            # The shield must stay active across both halves of an async fixture.
+            with recovery_scope:
+                try:
+                    async for value in original_asyncgen:
+                        yield value
+                finally:
+                    await original_asyncgen.aclose()
+
+        asyncgen = recovered_fixture()
         fixturevalue: T_Retval = self.get_loop().run_until_complete(
             self._call_in_runner_task(asyncgen.asend, None)
         )
@@ -2465,8 +2489,17 @@ class TestRunner(abc.TestRunner):
         fixture_func: Callable[..., Coroutine[Any, Any, T_Retval]],
         kwargs: dict[str, Any],
     ) -> T_Retval:
+        async def run_fixture_in_runner_task() -> T_Retval:
+            task_state = _task_states.get(cast(asyncio.Task, current_task()))
+            scope = task_state.cancel_scope if task_state else None
+            if scope is not None and scope._effectively_cancelled:
+                with CancelScope(shield=True):
+                    return await fixture_func(**kwargs)
+
+            return await fixture_func(**kwargs)
+
         retval = self.get_loop().run_until_complete(
-            self._call_in_runner_task(fixture_func, **kwargs)
+            self._call_in_runner_task(run_fixture_in_runner_task)
         )
         self._raise_async_exceptions()
         return retval
@@ -2476,9 +2509,18 @@ class TestRunner(abc.TestRunner):
     ) -> None:
         from _pytest.outcomes import OutcomeException
 
+        async def run_test_in_runner_task() -> None:
+            task_state = _task_states.get(cast(asyncio.Task, current_task()))
+            scope = task_state.cancel_scope if task_state else None
+            if scope is not None and scope._effectively_cancelled:
+                with CancelScope(shield=True):
+                    await test_func(**kwargs)
+            else:
+                await test_func(**kwargs)
+
         try:
             self.get_loop().run_until_complete(
-                self._call_in_runner_task(test_func, **kwargs)
+                self._call_in_runner_task(run_test_in_runner_task)
             )
         except Exception as exc:
             self._exceptions.append(exc)

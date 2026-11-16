@@ -61,3 +61,62 @@ async def test_task_group_cancellation_consume() -> None:
         async with create_task_group() as tg:
             tg.start_soon(consume, sigiter)
             tg.cancel_scope.cancel()
+
+
+async def test_restore_previous_python_signal_handler(anyio_backend_name: str) -> None:
+    if anyio_backend_name != "asyncio":
+        pytest.skip("asyncio backend regression")
+
+    previous = signal.getsignal(signal.SIGUSR1)
+    delivered: list[int] = []
+
+    def custom_handler(signum: int, frame: object) -> None:
+        delivered.append(signum)
+
+    signal.signal(signal.SIGUSR1, custom_handler)
+    try:
+        with open_signal_receiver(signal.SIGUSR1):
+            assert signal.getsignal(signal.SIGUSR1) is not custom_handler
+
+        assert signal.getsignal(signal.SIGUSR1) is custom_handler
+        os.kill(os.getpid(), signal.SIGUSR1)
+        assert delivered == [signal.SIGUSR1]
+    finally:
+        signal.signal(signal.SIGUSR1, previous)
+
+
+async def test_restore_ignored_signal(anyio_backend_name: str) -> None:
+    if anyio_backend_name != "asyncio":
+        pytest.skip("asyncio backend regression")
+
+    previous = signal.getsignal(signal.SIGUSR1)
+    signal.signal(signal.SIGUSR1, signal.SIG_IGN)
+    try:
+        with open_signal_receiver(signal.SIGUSR1):
+            assert signal.getsignal(signal.SIGUSR1) != signal.SIG_IGN
+
+        assert signal.getsignal(signal.SIGUSR1) == signal.SIG_IGN
+    finally:
+        signal.signal(signal.SIGUSR1, previous)
+
+
+async def test_failed_signal_registration_restores_handler(
+    anyio_backend_name: str,
+) -> None:
+    if anyio_backend_name != "asyncio":
+        pytest.skip("asyncio backend regression")
+
+    previous = signal.getsignal(signal.SIGUSR1)
+
+    def custom_handler(signum: int, frame: object) -> None:
+        pass
+
+    signal.signal(signal.SIGUSR1, custom_handler)
+    try:
+        with pytest.raises((RuntimeError, OSError)):
+            with open_signal_receiver(signal.SIGUSR1, signal.SIGKILL):
+                pass
+
+        assert signal.getsignal(signal.SIGUSR1) is custom_handler
+    finally:
+        signal.signal(signal.SIGUSR1, previous)

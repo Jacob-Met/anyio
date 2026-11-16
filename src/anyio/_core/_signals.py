@@ -22,8 +22,9 @@ def open_signal_receiver(
     .. warning:: Windows does not support signals natively so it is best to avoid
         relying on this in cross-platform applications.
 
-    .. warning:: On asyncio, this permanently replaces any previous signal handler for
-        the given signals, as set via :meth:`~asyncio.loop.add_signal_handler`.
+    .. warning:: On asyncio, previous handlers installed with
+        :meth:`~asyncio.loop.add_signal_handler` cannot be restored by the public
+        asyncio API. Handlers installed via :func:`signal.signal` are restored.
 
     """
     return get_async_backend().open_signal_receiver(*signals)

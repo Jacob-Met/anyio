@@ -19,7 +19,6 @@ from contextlib import (
 )
 from contextvars import Context
 from dataclasses import dataclass, field
-from functools import partial
 from inspect import isawaitable
 from threading import Lock, Thread, current_thread, get_ident
 from types import TracebackType
@@ -305,15 +304,17 @@ class BlockingPortal:
             or the exception raised during its execution
 
         """
-        run_sync(
-            partial(self._task_group.start_soon, name=name),
-            self._call_func,
-            func,
-            args,
-            kwargs,
-            future,
-            token=self._token,
-        )
+
+        def spawn() -> None:
+            try:
+                self._task_group.start_soon(
+                    self._call_func, func, args, kwargs, future, name=name
+                )
+            except BaseException as exc:
+                if future.set_running_or_notify_cancel():
+                    future.set_exception(exc)
+
+        self._token.backend_class.run_sync_soon(spawn, (), self._token.native_token)
 
     @overload
     def call(

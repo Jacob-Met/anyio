@@ -260,6 +260,7 @@ class AsyncBackend(metaclass=ABCMeta):
         group: str | int | None = None,
         extra_groups: Iterable[str | int] | None = None,
         umask: int = -1,
+        kill_timeout: float | None = None,
         **kwargs: Any,
     ) -> Process:
         pass

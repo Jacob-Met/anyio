@@ -969,3 +969,137 @@ def test_plugin_loads_with_filterwarnings_error(testdir: Pytester) -> None:
 
     result = testdir.runpytest_subprocess(*pytest_args)
     result.assert_outcomes(passed=1)
+
+
+@pytest.mark.parametrize("backend", get_available_backends())
+def test_background_fixture_failure_is_attributed_before_unrelated_test(
+    testdir: Pytester, backend: str
+) -> None:
+    import os
+    import subprocess
+    import sys
+
+    test_file = testdir.makepyfile(
+        f"""
+        import anyio
+        import pytest
+
+        @pytest.fixture(scope="module")
+        def anyio_backend():
+            return {backend!r}
+
+        @pytest.fixture(scope="module")
+        async def service():
+            async def background():
+                raise RuntimeError("MODULE_BACKGROUND_CRASH")
+
+            async with anyio.create_task_group() as task_group:
+                task_group.start_soon(background)
+                yield "ready"
+
+        @pytest.mark.anyio
+        async def test_uses_service(service):
+            await anyio.sleep(0)
+
+        @pytest.mark.anyio
+        async def test_unrelated():
+            await anyio.sleep(0)
+        """
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "--tb=short",
+            "-p",
+            "anyio",
+            "-p",
+            "no:asyncio",
+            "-p",
+            "no:trio",
+            str(test_file),
+        ],
+        cwd=os.path.dirname(str(test_file)),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=8,
+        check=False,
+    )
+    assert "MODULE_BACKGROUND_CRASH" in result.stdout
+    assert "1 passed" in result.stdout
+    assert "ERROR at teardown of test_unrelated" not in result.stdout
+
+
+@pytest.mark.parametrize("backend", get_available_backends())
+def test_failed_module_fixture_keeps_other_fixtures_active(
+    testdir: Pytester, backend: str
+) -> None:
+    import os
+    import subprocess
+    import sys
+
+    test_file = testdir.makepyfile(
+        f"""
+        import anyio
+        import pytest
+
+        @pytest.fixture(scope="module")
+        def anyio_backend():
+            return {backend!r}
+
+        @pytest.fixture(scope="module")
+        async def healthy():
+            state = {{"closed": False}}
+            async with anyio.create_task_group() as task_group:
+                task_group.start_soon(anyio.sleep_forever)
+                yield state
+                state["closed"] = True
+                task_group.cancel_scope.cancel()
+
+        @pytest.fixture(scope="module")
+        async def broken(healthy):
+            async def crash():
+                raise RuntimeError("BROKEN_MODULE")
+
+            async with anyio.create_task_group() as task_group:
+                task_group.start_soon(crash)
+                yield healthy
+
+        @pytest.mark.anyio
+        async def test_broken(broken):
+            await anyio.sleep(0)
+
+        @pytest.mark.anyio
+        async def test_healthy(healthy):
+            assert healthy["closed"] is False, "HEALTHY_FIXTURE_CLOSED"
+        """
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "--tb=short",
+            "-p",
+            "anyio",
+            "-p",
+            "no:asyncio",
+            "-p",
+            "no:trio",
+            str(test_file),
+        ],
+        cwd=os.path.dirname(str(test_file)),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=8,
+        check=False,
+    )
+    assert "BROKEN_MODULE" in result.stdout
+    assert "1 failed, 1 passed" in result.stdout
+    assert "HEALTHY_FIXTURE_CLOSED" not in result.stdout
+    assert "ERROR at teardown of test_healthy" not in result.stdout

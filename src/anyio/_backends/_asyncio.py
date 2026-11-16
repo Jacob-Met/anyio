@@ -2305,6 +2305,9 @@ class TestRunner(abc.TestRunner):
         self._runner = Runner(debug=debug, loop_factory=loop_factory)
         self._exceptions: list[BaseException] = []
         self._runner_task: asyncio.Task | None = None
+        self._active_fixture_generators: list[
+            tuple[AsyncGenerator[Any, Any], CancelScope | None]
+        ] = []
 
     def __enter__(self) -> Self:
         self._runner.__enter__()
@@ -2407,6 +2410,7 @@ class TestRunner(abc.TestRunner):
         kwargs: dict[str, Any],
     ) -> Iterable[T_Retval]:
         original_asyncgen = fixture_func(**kwargs)
+        fixture_scope: list[CancelScope | None] = [None]
 
         async def recovered_fixture() -> AsyncGenerator[T_Retval, Any]:
             task_state = _task_states.get(cast(asyncio.Task, current_task()))
@@ -2420,6 +2424,12 @@ class TestRunner(abc.TestRunner):
             with recovery_scope:
                 try:
                     async for value in original_asyncgen:
+                        task_state = _task_states.get(
+                            cast(asyncio.Task, current_task())
+                        )
+                        fixture_scope[0] = (
+                            task_state.cancel_scope if task_state else None
+                        )
                         yield value
                 finally:
                     await original_asyncgen.aclose()
@@ -2430,17 +2440,23 @@ class TestRunner(abc.TestRunner):
         )
         self._raise_async_exceptions()
 
-        yield fixturevalue
-
+        fixture_entry = (asyncgen, fixture_scope[0])
+        self._active_fixture_generators.append(fixture_entry)
         try:
-            self.get_loop().run_until_complete(
-                self._call_in_runner_task(asyncgen.asend, None)
-            )
-        except StopAsyncIteration:
-            self._raise_async_exceptions()
-        else:
-            self.get_loop().run_until_complete(asyncgen.aclose())
-            raise RuntimeError("Async generator fixture did not stop")
+            yield fixturevalue
+
+            try:
+                self.get_loop().run_until_complete(
+                    self._call_in_runner_task(asyncgen.asend, None)
+                )
+            except StopAsyncIteration:
+                self._raise_async_exceptions()
+            else:
+                self.get_loop().run_until_complete(asyncgen.aclose())
+                raise RuntimeError("Async generator fixture did not stop")
+        finally:
+            if fixture_entry in self._active_fixture_generators:
+                self._active_fixture_generators.remove(fixture_entry)
 
     def run_fixture(
         self,
@@ -2498,6 +2514,35 @@ class TestRunner(abc.TestRunner):
                 finally:
                     self._runner_task = None
             raise
+        # A failed background task group can cancel the shared test-runner task
+        # while an upper-scoped fixture is still suspended at its yield. Resolve
+        # its failure now, against the triggering test, rather than silently
+        # letting it surface at the teardown of the last unrelated test.
+        if self._runner_task is not None:
+            task_state = _task_states.get(self._runner_task)
+            scope = task_state.cancel_scope if task_state else None
+            cancelled_parent = False
+            cursor = scope
+            while cursor is not None:
+                cancelled_parent |= cursor.cancel_called
+                cursor = cursor._parent_scope
+            if cancelled_parent:
+                for asyncgen, fixture_scope in reversed(
+                    self._active_fixture_generators[:]
+                ):
+                    if fixture_scope is None or not fixture_scope.cancel_called:
+                        continue
+
+                    self._active_fixture_generators.remove((asyncgen, fixture_scope))
+                    try:
+                        self.get_loop().run_until_complete(
+                            self._call_in_runner_task(asyncgen.asend, None)
+                        )
+                    except StopAsyncIteration:
+                        pass
+                    except BaseException as exc:
+                        self._exceptions.append(exc)
+
         self._raise_async_exceptions()
 
 

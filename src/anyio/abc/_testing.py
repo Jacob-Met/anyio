@@ -16,6 +16,19 @@ class TestRunner(metaclass=ABCMeta):
 
     def __init__(self) -> None:
         self._failed_fixtures: dict[object, BaseException] = {}
+        self._unreported_fixture_errors: dict[object, BaseException] = {}
+
+    def _mark_unreported_fixture_error(
+        self, fixture_id: object | None, error: BaseException
+    ) -> None:
+        if fixture_id is not None:
+            self._unreported_fixture_errors.setdefault(fixture_id, error)
+
+    def _mark_fixture_failure_reported(self, fixture_id: object) -> None:
+        self._unreported_fixture_errors.pop(fixture_id, None)
+
+    def unreported_fixture_errors(self) -> list[tuple[object, BaseException]]:
+        return list(self._unreported_fixture_errors.items())
 
     def _mark_failed_fixture(
         self, fixture_id: object | None, error: BaseException
@@ -79,13 +92,17 @@ class TestRunner(metaclass=ABCMeta):
 
     @abstractmethod
     def run_test(
-        self, test_func: Callable[..., Coroutine[Any, Any, Any]], kwargs: dict[str, Any]
+        self,
+        test_func: Callable[..., Coroutine[Any, Any, Any]],
+        kwargs: dict[str, Any],
+        fixture_ids: frozenset[object] | None = None,
     ) -> None:
         """
         Run an async test function.
 
         :param test_func: the test function
         :param kwargs: keyword arguments to call the test function with
+        :param fixture_ids: active fixture identities, to avoid blaming unrelated tests
         """
 
     @abstractmethod

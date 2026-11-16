@@ -1095,7 +1095,9 @@ class TestRunner(abc.TestRunner):
 
         return self._call_in_runner_task(run_fixture_in_runner_task)
 
-    def _recover_failed_fixtures(self) -> None:
+    def _recover_failed_fixtures(
+        self, fixture_ids: frozenset[object] | None = None
+    ) -> None:
         errors: list[BaseException] = []
         active_fixtures = self._active_fixture_generators[:]
         for index in range(len(active_fixtures) - 1, -1, -1):
@@ -1129,7 +1131,10 @@ class TestRunner(abc.TestRunner):
                 pass
             except BaseException as exc:
                 self._mark_failed_fixture(fixture_id, exc)
-                errors.append(exc)
+                if fixture_ids is None or fixture_id in fixture_ids:
+                    errors.append(exc)
+                else:
+                    self._mark_unreported_fixture_error(fixture_id, exc)
 
         if len(errors) == 1:
             raise errors[0] from None
@@ -1137,18 +1142,29 @@ class TestRunner(abc.TestRunner):
             raise BaseExceptionGroup("Failed async fixtures", errors) from None
 
     def run_test(
-        self, test_func: Callable[..., Coroutine[Any, Any, Any]], kwargs: dict[str, Any]
+        self,
+        test_func: Callable[..., Coroutine[Any, Any, Any]],
+        kwargs: dict[str, Any],
+        fixture_ids: frozenset[object] | None = None,
     ) -> None:
         async def run_test_in_runner_task() -> None:
-            if trio.current_effective_deadline() == -math.inf:
-                with trio.CancelScope(shield=True):
+            test_error: Exception | None = None
+            try:
+                if trio.current_effective_deadline() == -math.inf:
+                    with trio.CancelScope(shield=True):
+                        await test_func(**kwargs)
+                else:
                     await test_func(**kwargs)
-            else:
-                await test_func(**kwargs)
+            except Exception as exc:
+                # A test assertion must not skip the checkpoint that discovers
+                # background failures from fixtures used by that same test.
+                test_error = exc
 
+            errors: list[BaseException] = []
             if self._active_fixture_generators:
                 # Let pending fixture children run once without turning an
                 # unrelated successful test into a second cancellation error.
+                await trio.lowlevel.cancel_shielded_checkpoint()
                 await trio.lowlevel.cancel_shielded_checkpoint()
 
                 # A failed outer fixture cannot be unwound while a healthy
@@ -1159,7 +1175,6 @@ class TestRunner(abc.TestRunner):
                     for _, scope, fixture_id in self._active_fixture_generators
                     if scope is not None and scope.cancel_called
                 }
-                errors: list[BaseException] = []
                 for nursery in trio.lowlevel.current_task().child_nurseries:
                     if nursery.cancel_scope not in scopes:
                         continue
@@ -1174,26 +1189,31 @@ class TestRunner(abc.TestRunner):
                         if not isinstance(exc, trio.Cancelled)
                     ]
                     if pending:
-                        self._mark_failed_fixture(
-                            scopes[nursery.cancel_scope], pending[0]
-                        )
-                        errors.extend(pending)
+                        fixture_id = scopes[nursery.cancel_scope]
+                        self._mark_failed_fixture(fixture_id, pending[0])
+                        if fixture_ids is None or fixture_id in fixture_ids:
+                            errors.extend(pending)
+                        else:
+                            self._mark_unreported_fixture_error(fixture_id, pending[0])
 
-                    for exc in pending:
-                        nursery._pending_excs.remove(exc)
+                    for pending_error in pending:
+                        nursery._pending_excs.remove(pending_error)
 
-                if len(errors) == 1:
-                    raise errors[0]
-                elif errors:
-                    raise BaseExceptionGroup("Failed async fixtures", errors)
+            if test_error is not None:
+                errors.insert(0, test_error)
+
+            if len(errors) == 1:
+                raise errors[0]
+            elif errors:
+                raise BaseExceptionGroup("Test and fixture failures", errors)
 
         try:
             self._call_in_runner_task(run_test_in_runner_task)
         except trio.Cancelled:
-            self._recover_failed_fixtures()
+            self._recover_failed_fixtures(fixture_ids)
             raise
         else:
-            self._recover_failed_fixtures()
+            self._recover_failed_fixtures(fixture_ids)
 
 
 class TrioTaskInfo(TaskInfo):

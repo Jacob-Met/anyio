@@ -1188,6 +1188,142 @@ def test_failed_outer_module_fixture_preserves_nested_fixture_scope(
 
 
 @pytest.mark.parametrize("backend", get_available_backends())
+def test_failing_test_and_fixture_child_both_fail_original_test(
+    testdir: Pytester, backend: str
+) -> None:
+    testdir.makepyfile(
+        f"""
+        import anyio
+        import pytest
+
+        @pytest.fixture(scope="module")
+        def anyio_backend():
+            return {backend!r}
+
+        @pytest.fixture(scope="module")
+        async def service():
+            trigger = anyio.Event()
+
+            async def crash():
+                await trigger.wait()
+                raise RuntimeError("BACKGROUND_ALSO_FAILED")
+
+            async with anyio.create_task_group() as group:
+                group.start_soon(crash)
+                yield trigger
+
+        @pytest.mark.anyio
+        async def test_simultaneous_errors(service):
+            service.set()
+            raise AssertionError("USER_ASSERTION_FAILED")
+
+        @pytest.mark.anyio
+        async def test_unrelated():
+            assert True
+        """
+    )
+
+    result = testdir.runpytest_subprocess(*pytest_args, "--tb=short", timeout=10)
+    result.assert_outcomes(failed=1, passed=1)
+    output = result.stdout.str()
+    assert "USER_ASSERTION_FAILED" in output
+    assert "BACKGROUND_ALSO_FAILED" in output
+    assert "test_unrelated PASSED" in output
+
+
+@pytest.mark.parametrize("backend", get_available_backends())
+def test_delayed_fixture_crash_does_not_fail_unrelated_test(
+    testdir: Pytester, backend: str
+) -> None:
+    testdir.makepyfile(
+        f"""
+        import anyio
+        import pytest
+
+        @pytest.fixture(scope="module")
+        def anyio_backend():
+            return {backend!r}
+
+        @pytest.fixture(scope="module")
+        async def shared_service():
+            trigger = anyio.Event()
+
+            async def crash_later():
+                await trigger.wait()
+                await anyio.sleep(0)
+                await anyio.sleep(0)
+                raise RuntimeError("DELAYED_CHILD_CRASH")
+
+            async with anyio.create_task_group() as group:
+                group.start_soon(crash_later)
+                yield trigger
+
+        @pytest.mark.anyio
+        async def test_trigger_without_await(shared_service):
+            shared_service.set()
+
+        @pytest.mark.anyio
+        async def test_unrelated():
+            assert True
+
+        @pytest.mark.anyio
+        async def test_dependent(shared_service):
+            print("RAN_WITH_FAILED_SERVICE")
+        """
+    )
+    result = testdir.runpytest_subprocess(*pytest_args, "-s", "--tb=short", timeout=10)
+    output = result.stdout.str()
+    assert "DELAYED_CHILD_CRASH" in output
+    assert "test_unrelated PASSED" in output
+    assert "test_dependent ERROR" in output
+    assert "RAN_WITH_FAILED_SERVICE" not in output
+
+
+@pytest.mark.parametrize("backend", get_available_backends())
+def test_late_fixture_crash_without_dependents_fails_session(
+    testdir: Pytester, backend: str
+) -> None:
+    testdir.makepyfile(
+        f"""
+        import anyio
+        import pytest
+
+        @pytest.fixture(scope="module")
+        def anyio_backend():
+            return {backend!r}
+
+        @pytest.fixture(scope="module")
+        async def service():
+            trigger = anyio.Event()
+
+            async def crash_later():
+                await trigger.wait()
+                await anyio.sleep(0)
+                await anyio.sleep(0)
+                raise RuntimeError("MUST_REPORT_CHILD_FAILURE")
+
+            async with anyio.create_task_group() as group:
+                group.start_soon(crash_later)
+                yield trigger
+
+        @pytest.mark.anyio
+        async def test_trigger_without_await(service):
+            service.set()
+
+        @pytest.mark.anyio
+        async def test_unrelated():
+            assert True
+        """
+    )
+    result = testdir.runpytest_subprocess(*pytest_args, "--tb=short", timeout=10)
+    output = result.stdout.str()
+    assert result.ret == 1
+    assert "test_unrelated PASSED" in output
+    assert "MUST_REPORT_CHILD_FAILURE" in output
+    assert "unreported async fixture failures" in output
+
+
+@pytest.mark.parametrize("backend", get_available_backends())
 def test_broken_module_fixture_does_not_serve_later_dependent_test(
     testdir: Pytester, backend: str
 ) -> None:

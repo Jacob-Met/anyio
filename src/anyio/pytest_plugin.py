@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import socket
+import traceback
 from collections.abc import Callable, Generator, Iterable, Iterator
 from contextlib import ExitStack, contextmanager
 from inspect import isasyncgenfunction, iscoroutinefunction, ismethod
@@ -11,6 +12,7 @@ import pytest
 from _pytest.fixtures import FixtureDef, FuncFixtureInfo, SubRequest
 from _pytest.outcomes import Exit
 from _pytest.scope import Scope
+from _pytest.terminal import TerminalReporter
 
 from . import get_available_backends
 from ._core._eventloop import (
@@ -39,6 +41,7 @@ else:
 _current_runner: TestRunner | None = None
 _runner_stack: ExitStack | None = None
 _runner_leases = 0
+_unreported_fixture_failures: dict[object, BaseException] = {}
 
 
 def extract_backend_and_options(backend: object) -> tuple[str, dict[str, Any]]:
@@ -77,8 +80,15 @@ def get_runner(
         _runner_leases -= 1
         if not _runner_leases:
             assert _runner_stack is not None
-            _runner_stack.close()
-            _runner_stack = _current_runner = None
+            runner = _current_runner
+            try:
+                _runner_stack.close()
+            finally:
+                if runner is not None:
+                    for fixture_id, error in runner.unreported_fixture_errors():
+                        _unreported_fixture_failures.setdefault(fixture_id, error)
+
+                _runner_stack = _current_runner = None
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -107,6 +117,7 @@ def _is_auto_mode(config: pytest.Config, mode: str) -> bool:
 
 
 def pytest_configure(config: pytest.Config) -> None:
+    _unreported_fixture_failures.clear()
     config.addinivalue_line(
         "markers",
         "anyio: mark the (coroutine function) test to be run asynchronously via anyio.",
@@ -195,6 +206,8 @@ def _reject_failed_fixture_dependencies(fixturedefs: Iterable[object]) -> None:
     failed = _current_runner.failed_fixture(fixturedefs)
     if failed is not None:
         fixturedef, error = failed
+        _current_runner._mark_fixture_failure_reported(fixturedef)
+        _unreported_fixture_failures.pop(fixturedef, None)
         raise RuntimeError(
             f"Async fixture {cast(FixtureDef[Any], fixturedef).argname!r} failed in an earlier test"
         ) from error
@@ -214,6 +227,28 @@ def pytest_runtest_setup(item: pytest.Item) -> Generator[None]:
     if isinstance(item, pytest.Function):
         # Cached fixtures do not call pytest_fixture_setup again.
         _reject_failed_fixture_dependencies(item._request._fixture_defs.values())
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    # A crashed fixture that no remaining test requested must still fail the run.
+    # Attribute it to the fixture, not to the next unrelated test.
+    if _unreported_fixture_failures and exitstatus == pytest.ExitCode.OK:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
+def pytest_terminal_summary(
+    terminalreporter: TerminalReporter, exitstatus: int, config: pytest.Config
+) -> None:
+    if not _unreported_fixture_failures:
+        return
+
+    terminalreporter.write_sep(
+        "=", f"{len(_unreported_fixture_failures)} unreported async fixture failures"
+    )
+    for fixturedef, error in _unreported_fixture_failures.items():
+        name = cast(FixtureDef[Any], fixturedef).argname
+        terminalreporter.write_line(f"Async fixture {name!r} failed in the background:")
+        terminalreporter.write_line("".join(traceback.format_exception(error)).rstrip())
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -296,7 +331,11 @@ def pytest_collection_finish(session: pytest.Session) -> None:
 def pytest_pyfunc_call(pyfuncitem: Any) -> bool | None:
     def run_with_hypothesis(**kwargs: Any) -> None:
         with get_runner(backend_name, backend_options) as runner:
-            runner.run_test(original_func, kwargs)
+            runner.run_test(
+                original_func,
+                kwargs,
+                fixture_ids=frozenset(pyfuncitem._request._fixture_defs.values()),
+            )
 
     backend = pyfuncitem.funcargs.get("anyio_backend")
     if backend:
@@ -320,7 +359,13 @@ def pytest_pyfunc_call(pyfuncitem: Any) -> bool | None:
             testargs = {arg: funcargs[arg] for arg in pyfuncitem._fixtureinfo.argnames}
             with get_runner(backend_name, backend_options) as runner:
                 try:
-                    runner.run_test(pyfuncitem.obj, testargs)
+                    runner.run_test(
+                        pyfuncitem.obj,
+                        testargs,
+                        fixture_ids=frozenset(
+                            pyfuncitem._request._fixture_defs.values()
+                        ),
+                    )
                 except ExceptionGroup as excgrp:
                     for exc in iterate_exceptions(excgrp):
                         if isinstance(exc, (Exit, KeyboardInterrupt, SystemExit)):

@@ -8,8 +8,9 @@ import stat
 import sys
 from collections.abc import Awaitable
 from dataclasses import dataclass
+from functools import partial
 from ipaddress import IPv4Address, IPv6Address, ip_address
-from os import PathLike, chmod
+from os import PathLike
 from socket import AddressFamily, SocketKind
 from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
@@ -38,8 +39,6 @@ if TYPE_CHECKING:
 else:
     FileDescriptorLike = object
 
-if sys.version_info < (3, 11):
-    from exceptiongroup import ExceptionGroup
 
 if sys.version_info >= (3, 12):
     from typing import override
@@ -59,6 +58,15 @@ AnyIPAddressFamily = Literal[
 IPAddressFamily = Literal[AddressFamily.AF_INET, AddressFamily.AF_INET6]
 
 
+def idna2008_resolve(host: str) -> bytes:
+    try:
+        return host.encode("ascii")
+    except UnicodeEncodeError:
+        import idna
+
+        return idna.encode(host, uts46=True)
+
+
 # tls_hostname given
 @overload
 async def connect_tcp(
@@ -66,6 +74,7 @@ async def connect_tcp(
     remote_port: int,
     *,
     local_host: IPAddressType | None = ...,
+    local_port: int | None = ...,
     ssl_context: ssl.SSLContext | None = ...,
     tls_standard_compatible: bool = ...,
     tls_hostname: str,
@@ -80,6 +89,7 @@ async def connect_tcp(
     remote_port: int,
     *,
     local_host: IPAddressType | None = ...,
+    local_port: int | None = ...,
     ssl_context: ssl.SSLContext,
     tls_standard_compatible: bool = ...,
     tls_hostname: str | None = ...,
@@ -94,6 +104,7 @@ async def connect_tcp(
     remote_port: int,
     *,
     local_host: IPAddressType | None = ...,
+    local_port: int | None = ...,
     tls: Literal[True],
     ssl_context: ssl.SSLContext | None = ...,
     tls_standard_compatible: bool = ...,
@@ -109,6 +120,7 @@ async def connect_tcp(
     remote_port: int,
     *,
     local_host: IPAddressType | None = ...,
+    local_port: int | None = ...,
     tls: Literal[False],
     ssl_context: ssl.SSLContext | None = ...,
     tls_standard_compatible: bool = ...,
@@ -124,6 +136,7 @@ async def connect_tcp(
     remote_port: int,
     *,
     local_host: IPAddressType | None = ...,
+    local_port: int | None = ...,
     happy_eyeballs_delay: float = ...,
 ) -> SocketStream: ...
 
@@ -133,6 +146,7 @@ async def connect_tcp(
     remote_port: int,
     *,
     local_host: IPAddressType | None = None,
+    local_port: int | None = None,
     tls: bool = False,
     ssl_context: ssl.SSLContext | None = None,
     tls_standard_compatible: bool = True,
@@ -156,6 +170,8 @@ async def connect_tcp(
     :param remote_port: port on the target host to connect to
     :param local_host: the interface address or name to bind the socket to before
         connecting
+    :param local_port: the local port to bind to (requires ``local_host`` to also be
+        set)
     :param tls: ``True`` to do a TLS handshake with the connected stream and return a
         :class:`~anyio.streams.tls.TLSStream` instead
     :param ssl_context: the SSL context object to use (if omitted, a default context is
@@ -196,7 +212,7 @@ async def connect_tcp(
     local_address: IPSockAddrType | None = None
     family = socket.AF_UNSPEC
     if local_host:
-        gai_res = await getaddrinfo(str(local_host), None)
+        gai_res = await getaddrinfo(str(local_host), local_port)
         family, *_, local_address = gai_res[0]
 
     target_host = str(remote_host)
@@ -246,6 +262,11 @@ async def connect_tcp(
                 else ExceptionGroup("multiple connection attempts failed", oserrors)
             )
             raise OSError("All connection attempts failed") from cause
+    except BaseException:
+        if connected_stream is not None:
+            await aclose_forcefully(connected_stream)
+
+        raise
     finally:
         oserrors.clear()
 
@@ -265,19 +286,25 @@ async def connect_tcp(
     return connected_stream
 
 
-async def connect_unix(path: str | bytes | PathLike[Any]) -> UNIXSocketStream:
+async def connect_unix(
+    path: str | bytes | PathLike[Any],
+    kind: Literal[
+        SocketKind.SOCK_STREAM, SocketKind.SOCK_SEQPACKET
+    ] = socket.SOCK_STREAM,
+) -> UNIXSocketStream:
     """
     Connect to the given UNIX socket.
 
     Not available on Windows.
 
     :param path: path to the socket
+    :param kind: socket type (``SOCK_STREAM`` or ``SOCK_SEQPACKET``)
     :return: a socket stream object
     :raises ConnectionFailed: if the connection fails
 
     """
     path = os.fspath(path)
-    return await get_async_backend().connect_unix(path)
+    return await get_async_backend().connect_unix(path, kind)
 
 
 async def create_tcp_listener(
@@ -376,7 +403,7 @@ async def create_tcp_listener(
 
     errors: list[OSError] = []
     try:
-        for _ in range(len(sockaddrs)):
+        for _ in range(10):  # enough to absorb ephemeral port collisions
             listeners: list[SocketListener] = []
             bound_ephemeral_port = local_port
             try:
@@ -422,6 +449,9 @@ async def create_unix_listener(
     *,
     mode: int | None = None,
     backlog: int = 65536,
+    kind: Literal[
+        SocketKind.SOCK_STREAM, SocketKind.SOCK_SEQPACKET
+    ] = SocketKind.SOCK_STREAM,
 ) -> SocketListener:
     """
     Create a UNIX socket listener.
@@ -429,9 +459,12 @@ async def create_unix_listener(
     Not available on Windows.
 
     :param path: path of the socket
-    :param mode: permissions to set on the socket
+    :param mode: permissions to set on the socket (on platforms other than Linux, these
+        are set after the socket file has been created, so the parent directory should
+        not be writable by untrusted users)
     :param backlog: maximum number of queued incoming connections (up to a maximum of
         2**16, or 65536)
+    :param kind: socket type (``SOCK_STREAM`` or ``SOCK_SEQPACKET``)
     :return: a listener object
 
     .. versionchanged:: 3.0
@@ -440,7 +473,7 @@ async def create_unix_listener(
 
     """
     backlog = min(backlog, 65536)
-    raw_socket = await setup_unix_local_socket(path, mode, socket.SOCK_STREAM)
+    raw_socket = await setup_unix_local_socket(path, mode, kind)
     try:
         raw_socket.listen(backlog)
         return get_async_backend().create_unix_listener(raw_socket)
@@ -485,9 +518,9 @@ async def create_udp_socket(
         family = cast(AnyIPAddressFamily, gai_res[0][0])
         local_address = gai_res[0][-1]
     elif family is AddressFamily.AF_INET6:
-        local_address = ("::", 0)
+        local_address = ("::", local_port)
     else:
-        local_address = ("0.0.0.0", 0)
+        local_address = ("0.0.0.0", local_port)
 
     sock = await get_async_backend().create_udp_socket(
         family, local_address, None, reuse_port
@@ -539,6 +572,12 @@ async def create_connected_udp_socket(
     family = cast(AnyIPAddressFamily, gai_res[0][0])
     remote_address = gai_res[0][-1]
 
+    if local_address is None and local_port:
+        if family is AddressFamily.AF_INET6:
+            local_address = ("::", local_port)
+        else:
+            local_address = ("0.0.0.0", local_port)
+
     sock = await get_async_backend().create_udp_socket(
         family, local_address, remote_address, reuse_port
     )
@@ -563,7 +602,9 @@ async def create_unix_datagram_socket(
     removed first.
 
     :param local_path: the path on which to bind to
-    :param local_mode: permissions to set on the local socket
+    :param local_mode: permissions to set on the local socket (on platforms other than
+        Linux, these are set after the socket file has been created, so the parent
+        directory should not be writable by untrusted users)
     :return: a UNIX datagram socket
 
     """
@@ -593,7 +634,9 @@ async def create_connected_unix_datagram_socket(
 
     :param remote_path: the path to set as the default target
     :param local_path: the path on which to bind to
-    :param local_mode: permissions to set on the local socket
+    :param local_mode: permissions to set on the local socket (on platforms other than
+        Linux, these are set after the socket file has been created, so the parent
+        directory should not be writable by untrusted users)
     :return: a connected UNIX datagram socket
 
     """
@@ -636,16 +679,7 @@ async def getaddrinfo(
 
     """
     # Handle unicode hostnames
-    if isinstance(host, str):
-        try:
-            encoded_host: bytes | None = host.encode("ascii")
-        except UnicodeEncodeError:
-            import idna
-
-            encoded_host = idna.encode(host, uts46=True)
-    else:
-        encoded_host = host
-
+    encoded_host = idna2008_resolve(host) if isinstance(host, str) else host
     gai_res = await get_async_backend().getaddrinfo(
         encoded_host, port, family=family, type=type, proto=proto, flags=flags
     )
@@ -830,7 +864,7 @@ def convert_ipv6_sockaddr(
     """
     # This is more complicated than it should be because of MyPy
     if isinstance(sockaddr, tuple) and len(sockaddr) == 4:
-        host, port, flowinfo, scope_id = sockaddr
+        host, port, _flowinfo, scope_id = sockaddr
         if scope_id:
             # PyPy (as of v7.3.11) leaves the interface name in the result, so
             # we discard it and only get the scope ID from the end
@@ -889,9 +923,18 @@ async def setup_unix_local_socket(
 
     if path_str is not None:
         try:
+            # On Linux, bind() creates the socket file with the mode of the unbound
+            # socket. Other platforms don't allow fchmod() on sockets, so the mode has
+            # to be set after binding, without following symlinks.
+            if mode is not None and sys.platform == "linux":
+                os.fchmod(raw_socket.fileno(), mode)
+
             await to_thread.run_sync(raw_socket.bind, path_str, abandon_on_cancel=True)
-            if mode is not None:
-                await to_thread.run_sync(chmod, path_str, mode, abandon_on_cancel=True)
+            if mode is not None and sys.platform != "linux":
+                await to_thread.run_sync(
+                    partial(os.chmod, path_str, mode, follow_symlinks=False),
+                    abandon_on_cancel=True,
+                )
         except BaseException:
             raw_socket.close()
             raise

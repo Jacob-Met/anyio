@@ -1,22 +1,23 @@
 from __future__ import annotations
 
+import asyncio
 import math
-import sys
 import threading
-import time
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Callable, Coroutine
 from concurrent import futures
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from contextvars import ContextVar
-from typing import Any, Literal, NoReturn, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar
+from unittest.mock import Mock
 
 import pytest
-from _pytest.logging import LogCaptureFixture
+from pytest import LogCaptureFixture
 
 from anyio import (
     CancelScope,
     Event,
+    NoEventLoopError,
     RunFinishedError,
     create_task_group,
     fail_after,
@@ -29,17 +30,21 @@ from anyio import (
     to_thread,
     wait_all_tasks_blocked,
 )
-from anyio._core._exceptions import NoEventLoopError
-from anyio.abc import TaskStatus
-from anyio.from_thread import BlockingPortal, start_blocking_portal
+from anyio._core._eventloop import current_async_library
+from anyio.from_thread import (
+    BlockingPortal,
+    BlockingPortalProvider,
+    start_blocking_portal,
+)
 from anyio.lowlevel import EventLoopToken, checkpoint, current_token
 
-from .conftest import asyncio_params
+from .conftest import asyncio_params, return_non_coro_awaitable
 
-if sys.version_info < (3, 11):
-    from exceptiongroup import ExceptionGroup
+if TYPE_CHECKING:
+    from anyio.abc import TaskStatus
 
-T_Retval = TypeVar("T_Retval")
+
+T = TypeVar("T")
 
 
 async def async_add(a: int, b: int) -> int:
@@ -56,45 +61,38 @@ def sync_add(a: int, b: int) -> int:
     return a + b
 
 
-def thread_worker_async(
-    func: Callable[..., Awaitable[T_Retval]], *args: Any
-) -> T_Retval:
+def thread_worker_async(func: Callable[..., Coroutine[Any, Any, T]], *args: Any) -> T:
     assert threading.current_thread() is not threading.main_thread()
     return from_thread.run(func, *args)
 
 
-def thread_worker_sync(func: Callable[..., T_Retval], *args: Any) -> T_Retval:
+def thread_worker_sync(func: Callable[..., T], *args: Any) -> T:
     assert threading.current_thread() is not threading.main_thread()
     return from_thread.run_sync(func, *args)
 
 
-@pytest.mark.parametrize("cancel", [True, False])
-async def test_thread_cancelled(cancel: bool) -> None:
+async def test_thread_cancelled() -> None:
     event = threading.Event()
-    thread_finished_future: Future[None] = Future()
+    started = finished = False
 
     def sync_function() -> None:
+        nonlocal started, finished
+        started = True
         event.wait(3)
-        try:
-            from_thread.check_cancelled()
-        except BaseException as exc:
-            thread_finished_future.set_exception(exc)
-        else:
-            thread_finished_future.set_result(None)
+        from_thread.check_cancelled()
+        finished = True
 
-    async with create_task_group() as tg:
-        tg.start_soon(to_thread.run_sync, sync_function)
+    async def canceller() -> None:
         await wait_all_tasks_blocked()
-        if cancel:
-            tg.cancel_scope.cancel()
-
+        tg.cancel_scope.cancel()
         event.set()
 
-    if cancel:
-        with pytest.raises(get_cancelled_exc_class()):
-            thread_finished_future.result(3)
-    else:
-        thread_finished_future.result(3)
+    async with create_task_group() as tg:
+        tg.start_soon(canceller)
+        await to_thread.run_sync(sync_function)
+
+    assert started
+    assert not finished
 
 
 async def test_thread_cancelled_and_abandoned() -> None:
@@ -197,27 +195,17 @@ class TestRunAsyncFromThread:
         assert result == 7
 
     def test_run_sync_from_thread_pooling(self) -> None:
-        async def main() -> None:
-            thread_ids = set()
-            for _ in range(5):
-                thread_ids.add(await to_thread.run_sync(threading.get_ident))
+        async def main() -> threading.Thread:
+            threads = [
+                await to_thread.run_sync(threading.current_thread) for _ in range(5)
+            ]
+            assert all(thread is threads[0] for thread in threads)
+            assert threads[0] is not threading.current_thread()
+            return threads[0]
 
-            # Expects that all the work has been done in the same worker thread
-            assert len(thread_ids) == 1
-            assert thread_ids.pop() != threading.get_ident()
-            assert threading.active_count() == initial_count + 1
-
-        # The thread should not exist after the event loop has been closed
-        initial_count = threading.active_count()
-        run(main, backend="asyncio")
-
-        for _ in range(10):
-            if threading.active_count() == initial_count:
-                return
-
-            time.sleep(0.1)
-
-        pytest.fail("Worker thread did not exit within 1 second")
+        # The global pool reuses workers across independent event loops.
+        worker = run(main, backend="asyncio")
+        assert run(main, backend="asyncio") is worker
 
     async def test_run_async_from_thread_exception(self) -> None:
         with pytest.raises(TypeError) as exc:
@@ -337,6 +325,49 @@ class TestRunSyncFromThread:
 
         assert await to_thread.run_sync(worker) == anyio_backend_name
 
+    @pytest.mark.parametrize("anyio_backend", asyncio_params)
+    async def test_get_current_task(self) -> None:
+        """
+        Regression test for #773: get_current_task() must raise a clear
+        RuntimeError, not an opaque weakref TypeError, when called from a
+        callback scheduled via loop.call_soon_threadsafe() (as from_thread.run_sync
+        does), where asyncio.current_task() is legitimately None.
+        """
+
+        def worker() -> None:
+            from_thread.run_sync(get_current_task)
+
+        with pytest.raises(RuntimeError, match="There is no task currently running"):
+            await to_thread.run_sync(worker)
+
+
+@pytest.mark.parametrize("close_during_schedule", [False, True])
+def test_run_sync_soon_closed_event_loop(close_during_schedule: bool) -> None:
+    from anyio._backends._asyncio import AsyncIOBackend
+
+    loop = asyncio.new_event_loop()
+    callback = Mock()
+    original_call_soon_threadsafe = loop.call_soon_threadsafe
+
+    def call_soon_threadsafe(*args: Any) -> None:
+        loop.close()
+        original_call_soon_threadsafe(*args)
+
+    if close_during_schedule:
+        loop.call_soon_threadsafe = Mock(  # type: ignore[method-assign]
+            side_effect=call_soon_threadsafe
+        )
+    else:
+        loop.close()
+
+    try:
+        with pytest.raises(RunFinishedError):
+            AsyncIOBackend.run_sync_soon(callback, (), loop)
+    finally:
+        loop.close()
+
+    callback.assert_not_called()
+
 
 class TestBlockingPortal:
     class AsyncCM:
@@ -354,6 +385,209 @@ class TestBlockingPortal:
     async def test_call_corofunc(self) -> None:
         async with BlockingPortal() as portal:
             result = await to_thread.run_sync(portal.call, async_add, 1, 2)
+            assert result == 3
+
+    @pytest.mark.parametrize("target_backend", get_available_backends())
+    async def test_call_async_corofunc(self, target_backend: str) -> None:
+        async def get_backend_and_add(a: int, b: int) -> tuple[str, int]:
+            await checkpoint()
+            backend = current_async_library()
+            assert backend is not None
+            return backend, a + b
+
+        portal_cm = start_blocking_portal(backend=target_backend)
+        portal = await to_thread.run_sync(portal_cm.__enter__)
+        try:
+            result = await portal.call_async(get_backend_and_add, 1, 2)
+        finally:
+            await to_thread.run_sync(portal_cm.__exit__, None, None, None)
+
+        assert result == (target_backend, 3)
+
+    async def test_call_async_exception(self) -> None:
+        def raise_exception() -> NoReturn:
+            raise ValueError("test")
+
+        portal_cm = start_blocking_portal()
+        portal = await to_thread.run_sync(portal_cm.__enter__)
+        try:
+            with pytest.raises(ValueError, match="test"):
+                await portal.call_async(raise_exception)
+        finally:
+            await to_thread.run_sync(portal_cm.__exit__, None, None, None)
+
+    @pytest.mark.parametrize("target_backend", get_available_backends())
+    async def test_call_async_context_variable(self, target_backend: str) -> None:
+        var = ContextVar[str]("var")
+
+        async def read_var() -> str:
+            await checkpoint()
+            return var.get()
+
+        portal_cm = start_blocking_portal(backend=target_backend)
+        portal = await to_thread.run_sync(portal_cm.__enter__)
+        try:
+            var.set("value")
+            assert await portal.call_async(read_var) == "value"
+        finally:
+            await to_thread.run_sync(portal_cm.__exit__, None, None, None)
+
+    @pytest.mark.parametrize("target_backend", get_available_backends())
+    async def test_call_async_cancellation(self, target_backend: str) -> None:
+        started = threading.Event()
+        finished = threading.Event()
+
+        async def wait_forever() -> None:
+            started.set()
+            try:
+                await sleep(math.inf)
+            finally:
+                finished.set()
+
+        async def cancel_when_started(scope: CancelScope) -> None:
+            await to_thread.run_sync(started.wait)
+            scope.cancel()
+
+        portal_cm = start_blocking_portal(backend=target_backend)
+        portal = await to_thread.run_sync(portal_cm.__enter__)
+        try:
+            with CancelScope() as scope:
+                async with create_task_group() as tg:
+                    tg.start_soon(cancel_when_started, scope)
+                    await portal.call_async(wait_forever)
+
+            assert await to_thread.run_sync(finished.wait, 1)
+        finally:
+            await to_thread.run_sync(portal_cm.__exit__, None, None, None)
+
+    @pytest.mark.parametrize("target_backend", get_available_backends())
+    @pytest.mark.parametrize("abandon_on_cancel", [False, True])
+    @pytest.mark.parametrize("cleanup_raises", [False, True])
+    async def test_call_async_cancellation_cleanup(
+        self, target_backend: str, abandon_on_cancel: bool, cleanup_raises: bool
+    ) -> None:
+        started = threading.Event()
+        cleanup_started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        returned = Event()
+        errors: list[ValueError] = []
+
+        async def target() -> None:
+            started.set()
+            try:
+                await sleep(math.inf)
+            finally:
+                cleanup_started.set()
+                with CancelScope(shield=True):
+                    assert await to_thread.run_sync(release.wait, 5)
+
+                finished.set()
+                if cleanup_raises:
+                    raise ValueError("cleanup failed")
+
+        async def caller(*, task_status: TaskStatus[CancelScope]) -> None:
+            try:
+                with CancelScope() as scope:
+                    task_status.started(scope)
+                    await portal.call_async(target, abandon_on_cancel=abandon_on_cancel)
+
+                assert scope.cancelled_caught
+            except ValueError as exc:
+                errors.append(exc)
+            finally:
+                returned.set()
+
+        portal_cm = start_blocking_portal(backend=target_backend)
+        portal = await to_thread.run_sync(portal_cm.__enter__)
+        try:
+            async with create_task_group() as tg:
+                scope = await tg.start(caller)
+                try:
+                    assert await to_thread.run_sync(started.wait, 5)
+                    scope.cancel()
+                    assert await to_thread.run_sync(cleanup_started.wait, 5)
+                    await wait_all_tasks_blocked()
+                    assert returned.is_set() == abandon_on_cancel
+                finally:
+                    release.set()
+
+            assert await to_thread.run_sync(finished.wait, 5)
+            assert [str(exc) for exc in errors] == (
+                ["cleanup failed"] if cleanup_raises and not abandon_on_cancel else []
+            )
+            assert await portal.call_async(lambda: "still running") == "still running"
+        finally:
+            release.set()
+            await to_thread.run_sync(portal_cm.__exit__, None, None, None)
+
+    @pytest.mark.parametrize("target_backend", get_available_backends())
+    @pytest.mark.usefixtures("deactivate_blockbuster")
+    async def test_call_async_cancellation_does_not_block(
+        self, target_backend: str
+    ) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        released_by_caller = False
+
+        async def block_event_loop() -> None:
+            nonlocal released_by_caller
+            started.set()
+            released_by_caller = release.wait(2)
+            await checkpoint()
+
+        async def cancel_when_started(scope: CancelScope) -> None:
+            await to_thread.run_sync(started.wait)
+            scope.cancel()
+
+        portal_cm = start_blocking_portal(backend=target_backend)
+        portal = await to_thread.run_sync(portal_cm.__enter__)
+        try:
+            with CancelScope() as scope:
+                async with create_task_group() as tg:
+                    tg.start_soon(cancel_when_started, scope)
+                    await portal.call_async(block_event_loop, abandon_on_cancel=True)
+        finally:
+            release.set()
+            await to_thread.run_sync(portal_cm.__exit__, None, None, None)
+
+        assert scope.cancelled_caught
+        assert released_by_caller
+
+    @pytest.mark.parametrize("target_backend", get_available_backends())
+    @pytest.mark.usefixtures("deactivate_blockbuster")
+    async def test_future_cancellation_does_not_block(
+        self, target_backend: str
+    ) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        released_by_caller = False
+
+        async def block_event_loop() -> None:
+            nonlocal released_by_caller
+            started.set()
+            released_by_caller = release.wait(2)
+            await sleep(math.inf)
+
+        portal_cm = start_blocking_portal(backend=target_backend)
+        portal = await to_thread.run_sync(portal_cm.__enter__)
+        try:
+            future = await to_thread.run_sync(portal.start_task_soon, block_event_loop)
+            await to_thread.run_sync(started.wait)
+            # Future callbacks run synchronously in the thread calling cancel().
+            # The portal cannot process cancellation until this loop releases it.
+            assert future.cancel()
+        finally:
+            release.set()
+            await to_thread.run_sync(portal_cm.__exit__, None, None, None)
+
+        assert released_by_caller
+
+    async def test_call_non_corofunc(self) -> None:
+        async with BlockingPortal() as portal:
+            result = await to_thread.run_sync(
+                portal.call, return_non_coro_awaitable(async_add), 1, 2
+            )
             assert result == 3
 
     async def test_call_anext(self) -> None:
@@ -456,9 +690,8 @@ class TestBlockingPortal:
             )
 
     def test_start_with_nonexistent_backend(self) -> None:
-        with pytest.raises(LookupError) as exc:
-            with start_blocking_portal("foo"):
-                pass
+        with pytest.raises(LookupError) as exc, start_blocking_portal("foo"):
+            pass
 
         exc.match("No such backend: foo")
 
@@ -487,6 +720,17 @@ class TestBlockingPortal:
             portal.call(event1.set)
             portal.call(event2.wait)
             assert future.result() == "test"
+
+    def test_start_task_soon_non_corofunc(
+        self, anyio_backend_name: str, anyio_backend_options: dict[str, Any]
+    ) -> None:
+        @return_non_coro_awaitable
+        async def taskfunc() -> Literal["test"]:
+            return "test"
+
+        with start_blocking_portal(anyio_backend_name, anyio_backend_options) as portal:
+            future = portal.start_task_soon(taskfunc)
+        assert future.result() == "test"
 
     def test_start_task_soon_cancel_later(
         self, anyio_backend_name: str, anyio_backend_options: dict[str, Any]
@@ -520,6 +764,59 @@ class TestBlockingPortal:
             future = portal.start_task_soon(event_waiter)
             future.cancel()
             done_event.wait(10)
+
+        assert cancelled
+
+    @pytest.mark.parametrize(
+        "raises", [pytest.param(False, id="result"), pytest.param(True, id="exception")]
+    )
+    async def test_cancel_during_completion(
+        self, monkeypatch: pytest.MonkeyPatch, raises: bool
+    ) -> None:
+        class RacingFuture(Future[Any]):
+            def set_result(self, result: Any) -> None:
+                self.cancel()
+                super().set_result(result)
+
+            def set_exception(self, exception: BaseException | None) -> None:
+                self.cancel()
+                super().set_exception(exception)
+
+        async def func() -> str:
+            if raises:
+                raise ValueError("foo")
+
+            return "foo"
+
+        monkeypatch.setattr(from_thread, "Future", RacingFuture)
+        async with BlockingPortal() as portal:
+            if raises:
+                with pytest.raises(ValueError, match="foo"):
+                    await to_thread.run_sync(portal.call, func)
+            else:
+                assert await to_thread.run_sync(portal.call, func) == "foo"
+
+    def test_start_task_soon_cancel_after_stop(
+        self, anyio_backend_name: str, anyio_backend_options: dict[str, Any]
+    ) -> None:
+        cancelled = False
+        done_event = threading.Event()
+
+        async def event_waiter() -> None:
+            nonlocal cancelled
+            try:
+                await sleep(10)
+            except get_cancelled_exc_class():
+                cancelled = True
+            finally:
+                done_event.set()
+
+        with start_blocking_portal(anyio_backend_name, anyio_backend_options) as portal:
+            future = portal.start_task_soon(event_waiter)
+            portal.call(wait_all_tasks_blocked)
+            portal.call(portal.stop)
+            future.cancel()
+            done_event.wait(5)
 
         assert cancelled
 
@@ -613,6 +910,18 @@ class TestBlockingPortal:
             assert value == "foo"
             assert future.result() is None
 
+    def test_start_non_corofunc(
+        self, anyio_backend_name: str, anyio_backend_options: dict[str, Any]
+    ) -> None:
+        @return_non_coro_awaitable
+        async def taskfunc(*, task_status: TaskStatus[str]) -> None:
+            task_status.started("foo")
+
+        with start_blocking_portal(anyio_backend_name, anyio_backend_options) as portal:
+            future, value = portal.start_task(taskfunc)
+            assert value == "foo"
+            assert future.result() is None
+
     def test_start_crash_before_started_call(
         self, anyio_backend_name: str, anyio_backend_options: dict[str, Any]
     ) -> None:
@@ -653,7 +962,7 @@ class TestBlockingPortal:
             task_status.started(get_current_task().name)
 
         with start_blocking_portal(anyio_backend_name, anyio_backend_options) as portal:
-            future, start_value = portal.start_task(taskfunc, name="testname")
+            _future, start_value = portal.start_task(taskfunc, name="testname")
             assert start_value == "testname"
 
     def test_contextvar_propagation_sync(
@@ -738,8 +1047,8 @@ class TestBlockingPortal:
         def sync_thread() -> None:
             fs = [portal.start_task_soon(sleep, math.inf)]
             from_thread.run_sync(event.set)
-            done, not_done = futures.wait(
-                fs, timeout=1, return_when=futures.FIRST_COMPLETED
+            _done, not_done = futures.wait(
+                fs, timeout=5, return_when=futures.FIRST_COMPLETED
             )
             assert not not_done
 
@@ -749,3 +1058,17 @@ class TestBlockingPortal:
                 # Ensure thread has time to start the task
                 await event.wait()
                 await portal.stop(cancel_remaining=True)
+
+
+class TestBlockingPortalProvider:
+    def test_exception_passed_to_portal_cm(
+        self, anyio_backend_name: str, anyio_backend_options: dict[str, Any]
+    ) -> None:
+        provider = BlockingPortalProvider(anyio_backend_name, anyio_backend_options)
+        with pytest.raises(RuntimeError, match="boom"):
+            with provider as portal:
+                future = portal.start_task_soon(sleep, 10)
+                portal.call(wait_all_tasks_blocked)
+                raise RuntimeError("boom")
+
+        assert future.cancelled()

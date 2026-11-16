@@ -1,12 +1,8 @@
 from __future__ import annotations
 
-import sys
 from collections.abc import Generator
 from textwrap import dedent
 from typing import Any
-
-if sys.version_info < (3, 11):
-    from exceptiongroup import BaseExceptionGroup
 
 
 class BrokenResourceError(Exception):
@@ -154,3 +150,52 @@ class RunFinishedError(RuntimeError):
         super().__init__(
             "The event loop associated with the given token has already finished"
         )
+
+
+class TaskFailed(Exception):
+    """
+    Raised when awaiting on, or attempting to access the return value of, a
+    :class:`.TaskHandle` that raised an exception.
+    """
+
+
+class TaskCancelled(TaskFailed):
+    """
+    Raised when awaiting on, or attempting to access the return value of, a
+    :class:`.TaskHandle` that was cancelled.
+    """
+
+
+class TaskNotFinished(Exception):
+    """
+    Raised when attempting to access the return value or exception of a
+    :class:`.TaskHandle` that is still pending completion.
+    """
+
+
+class FutureFailed(Exception):
+    """
+    Raised when awaiting on, or attempting to access the return value of, a
+    :class:`.Future` that raised an exception.
+    """
+
+
+class FutureCancelled(FutureFailed):
+    """
+    Raised when attempting to access the return value or exception of a
+    :class:`.Future` that was cancelled.
+    """
+
+
+class FutureNotFinished(Exception):
+    """
+    Raised when attempting to access the return value or exception of a
+    :class:`.Future` that is still pending completion.
+    """
+
+
+class FutureAlreadyFinished(Exception):
+    """
+    Raised when attempting set a result of or await a
+    :class:`.Future` that has already completed.
+    """

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 from collections.abc import AsyncGenerator, Generator
 from contextlib import (
     AbstractContextManager,
@@ -9,11 +8,7 @@ from contextlib import (
     asynccontextmanager,
     contextmanager,
 )
-
-if sys.version_info >= (3, 11):
-    from typing import Self
-else:
-    from typing_extensions import Self
+from typing import Self
 
 import pytest
 
@@ -104,13 +99,15 @@ class TestContextManagerMixin:
                 pass
 
     def test_enter_twice(self) -> None:
-        with DummyContextManager() as cm:
-            with pytest.raises(
+        with (
+            DummyContextManager() as cm,
+            pytest.raises(
                 RuntimeError,
                 match="^this DummyContextManager has already been entered$",
-            ):
-                with cm:
-                    pass
+            ),
+            cm,
+        ):
+            pass
 
     def test_exit_before_enter(self) -> None:
         cm = DummyContextManager()
@@ -199,11 +196,11 @@ class TestAsyncContextManagerMixin:
 
     async def test_return_coroutine(self) -> None:
         class BadContextManager(AsyncContextManagerMixin):
-            async def __asynccontextmanager__(self):  # type: ignore[no-untyped-def]
+            async def __asynccontextmanager__(self):  # type: ignore[no-untyped-def,override]
                 return self
 
         with pytest.raises(TypeError, match="returned a coroutine object instead of"):
-            async with BadContextManager():
+            async with BadContextManager():  # type: ignore[misc]
                 pass
 
     async def test_enter_twice(self) -> None:

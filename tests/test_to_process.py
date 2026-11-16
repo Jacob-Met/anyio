@@ -58,6 +58,30 @@ async def test_print() -> None:
     assert await to_process.run_sync(os.getpid) == worker_pid
 
 
+def _flood_stderr() -> str:
+    """Helper that writes enough data to stderr to fill an undrained pipe buffer."""
+
+    # A typical pipe buffer is 64 KiB; write well beyond that to ensure it would block
+    # if stderr were still connected to the (undrained) parent pipe.
+    payload = "x" * (1024 * 1024)
+    for stream in sys.stdout, sys.stderr:
+        stream.write(payload)
+        stream.flush()
+
+    return "completed"
+
+
+async def test_stderr_flood() -> None:
+    """
+    Test that writing large amounts of data to stderr in the worker process won't
+    deadlock the call. Regression test for the worker's stderr not being redirected to
+    /dev/null, leaving it connected to an undrained pipe.
+    """
+
+    with fail_after(10):
+        assert await to_process.run_sync(_flood_stderr) == "completed"
+
+
 async def test_cancel_before() -> None:
     """
     Test that starting to_process.run_sync() in a cancelled scope does not cause a
@@ -128,3 +152,24 @@ async def test_nonexistent_main_module(
     script_path.touch()
     monkeypatch.setattr("__main__.__file__", str(script_path / "__main__.py"))
     await to_process.run_sync(os.getpid)
+
+
+def _check_main_importable() -> int:
+    """Helper that runs in the worker process to check main was imported correctly"""
+
+    # python multiprocessing does it this way and there is probably code dependent on it.
+    assert sys.modules["__main__"] == sys.modules["__mp_main__"]
+
+    return sys.modules["__main__"].foo
+
+
+async def test_entrypoint_main_module(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+    """
+    Test that worker process creation succeeds when __main__.__file__ points to an
+    entry point script (no .py extension). Regression test for #1027.
+    """
+
+    script_path = tmp_path / "my-entrypoint"
+    script_path.write_text("foo=3")
+    monkeypatch.setattr("__main__.__file__", str(script_path))
+    assert await to_process.run_sync(_check_main_importable) == 3

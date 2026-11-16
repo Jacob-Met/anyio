@@ -1,22 +1,20 @@
 from __future__ import annotations
 
 __all__ = (
-    "run_sync",
     "current_default_thread_limiter",
+    "run_sync",
 )
 
-import sys
 from collections.abc import Callable
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 from warnings import warn
 
 from ._core._eventloop import get_async_backend
-from .abc import CapacityLimiter
 
-if sys.version_info >= (3, 11):
-    from typing import TypeVarTuple, Unpack
-else:
-    from typing_extensions import TypeVarTuple, Unpack
+if TYPE_CHECKING:
+    from ._core._synchronization import CapacityLimiter
+
+from typing import TypeVarTuple, Unpack
 
 T_Retval = TypeVar("T_Retval")
 PosArgsT = TypeVarTuple("PosArgsT")
@@ -24,7 +22,7 @@ PosArgsT = TypeVarTuple("PosArgsT")
 
 async def run_sync(
     func: Callable[[Unpack[PosArgsT]], T_Retval],
-    *args: Unpack[PosArgsT],
+    *args: *PosArgsT,
     abandon_on_cancel: bool = False,
     cancellable: bool | None = None,
     limiter: CapacityLimiter | None = None,
@@ -32,9 +30,9 @@ async def run_sync(
     """
     Call the given function with the given arguments in a worker thread.
 
-    If the ``cancellable`` option is enabled and the task waiting for its completion is
-    cancelled, the thread will still run its course but its return value (or any raised
-    exception) will be ignored.
+    If the ``abandon_on_cancel`` option is enabled and the task waiting for its
+    completion is cancelled, the thread will still run its course but its
+    return value (or any raised exception) will be ignored.
 
     :param func: a callable
     :param args: positional arguments for the callable

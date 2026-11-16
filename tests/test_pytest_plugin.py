@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import socket
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import pytest
 from _pytest.logging import LogCaptureFixture
 from _pytest.pytester import Pytester
 
-from anyio import get_all_backends, get_available_backends
-from anyio.pytest_plugin import FreePortFactory
+from anyio import get_available_backends
+
+if TYPE_CHECKING:
+    from anyio.pytest_plugin import FreePortFactory
 
 pytestmark = [
     pytest.mark.filterwarnings(
@@ -146,7 +149,8 @@ def test_asyncio(testdir: Pytester, caplog: LogCaptureFixture) -> None:
 
         class TestClassFixtures:
             @pytest.fixture(scope='class')
-            async def async_class_fixture(self, anyio_backend):
+            @classmethod
+            async def async_class_fixture(cls, anyio_backend):
                 await asyncio.sleep(0)
                 return anyio_backend
 
@@ -426,7 +430,50 @@ def test_hypothesis_function_mark(testdir: Pytester) -> None:
     )
 
 
-@pytest.mark.parametrize("anyio_backend", get_available_backends(), indirect=True)
+def test_hypothesis_multiple_backends(testdir: Pytester) -> None:
+    testdir.makepyfile(
+        """
+        import pytest
+        from hypothesis import given
+        from hypothesis.strategies import just
+
+        from anyio._core._eventloop import current_async_library
+
+
+        @pytest.mark.anyio
+        @given(x=just(1))
+        async def test_hypothesis_backends(x, anyio_backend):
+            assert current_async_library() == anyio_backend
+        """
+    )
+
+    result = testdir.runpytest(*pytest_args)
+    result.assert_outcomes(passed=len(get_available_backends()))
+
+
+def test_hypothesis_multiple_backends_in_class(testdir: Pytester) -> None:
+    testdir.makepyfile(
+        """
+        import pytest
+        from hypothesis import given
+        from hypothesis.strategies import just
+
+        from anyio._core._eventloop import current_async_library
+
+
+        class TestHypothesis:
+            @pytest.mark.anyio
+            @given(x=just(1))
+            async def test_hypothesis_backends(self, x, anyio_backend):
+                assert current_async_library() == anyio_backend
+        """
+    )
+
+    result = testdir.runpytest(*pytest_args)
+    result.assert_outcomes(passed=len(get_available_backends()))
+
+
+@pytest.mark.parametrize("anyio_backend_name", get_available_backends())
 def test_debugger_exit_in_taskgroup(testdir: Pytester, anyio_backend_name: str) -> None:
     testdir.makepyfile(
         f"""
@@ -449,7 +496,7 @@ def test_debugger_exit_in_taskgroup(testdir: Pytester, anyio_backend_name: str) 
     result.assert_outcomes()
 
 
-@pytest.mark.parametrize("anyio_backend", get_all_backends(), indirect=True)
+@pytest.mark.parametrize("anyio_backend_name", get_available_backends())
 def test_keyboardinterrupt_during_test(
     testdir: Pytester, anyio_backend_name: str
 ) -> None:
@@ -474,6 +521,71 @@ def test_keyboardinterrupt_during_test(
     )
 
     testdir.runpytest_subprocess(*pytest_args, timeout=3)
+
+
+def test_keyboard_interrupt_does_not_resume_test(testdir: Pytester) -> None:
+    # Regression test for #1060
+    testdir.makepyfile(
+        """
+        import asyncio
+        import signal
+
+        import anyio
+        import pytest
+
+        @pytest.fixture
+        def anyio_backend():
+            return "asyncio"
+
+        @pytest.fixture
+        async def myfixture():
+            yield
+
+        @pytest.mark.anyio
+        async def test_keyboard_interrupt(myfixture):
+            loop = asyncio.get_running_loop()
+            loop.call_soon(signal.raise_signal, signal.SIGINT)
+            await anyio.sleep(5)
+            print("RESUMED_AFTER_INTERRUPT")
+        """
+    )
+
+    result = testdir.runpytest_subprocess(*pytest_args)
+    assert result.ret == 2
+    result.stdout.no_fnmatch_line("*RESUMED_AFTER_INTERRUPT*")
+    result.stdout.fnmatch_lines(["*KeyboardInterrupt*"])
+
+
+def test_outcome_exception_does_not_discard_runner_task(testdir: Pytester) -> None:
+    # Regression test for #1179
+    testdir.makepyfile(
+        """
+        import anyio
+        import pytest
+
+        @pytest.fixture(scope="session")
+        def anyio_backend():
+            return "asyncio"
+
+        @pytest.fixture(scope="session")
+        async def background_resource():
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(anyio.sleep_forever)
+                yield "resource"
+                tg.cancel_scope.cancel()
+
+        @pytest.mark.anyio
+        async def test_uses_the_resource(background_resource: str) -> None:
+            assert background_resource == "resource"
+
+        @pytest.mark.anyio
+        async def test_that_skips() -> None:
+            pytest.skip("anything that raises pytest's OutcomeException.")
+        """
+    )
+
+    result = testdir.runpytest(*pytest_args)
+    result.assert_outcomes(passed=1, skipped=1)
 
 
 def test_async_fixture_in_test_class(testdir: Pytester) -> None:
@@ -528,7 +640,6 @@ def test_asyncgen_fixture_in_test_class(testdir: Pytester) -> None:
 def test_async_fixture_params(testdir: Pytester) -> None:
     testdir.makepyfile(
         """
-        import inspect
         import pytest
 
         @pytest.fixture(params=[1, 2])
@@ -545,6 +656,39 @@ def test_async_fixture_params(testdir: Pytester) -> None:
     result.assert_outcomes(passed=len(get_available_backends()) * 2)
 
 
+def test_dynamic_async_fixture_access_does_not_hang(testdir: Pytester) -> None:
+    """
+    Test for a situation when an async test or fixture dynamically request an async fixture
+    via request.getfixturevalue() from causing a re-entrant call into the test runner.
+    on trio it will deadlock, on asyncio it raises RuntimeError. This test is to ensure
+    both backends fail with a clear error.
+
+    Regression test for https://github.com/agronholm/anyio/issues/1148
+    """
+    testdir.makepyfile(
+        """
+        import pytest
+
+        @pytest.fixture
+        async def f():
+            return 1
+
+        @pytest.mark.anyio
+        async def test_something(request):
+            value = request.getfixturevalue('f')
+            assert value == 1
+        """
+    )
+
+    result = testdir.runpytest_subprocess(*pytest_args, timeout=3)
+    result.stdout.fnmatch_lines(
+        [
+            "*RuntimeError: Cannot schedule a coroutine in the test runner while another is already running;*"
+        ]
+    )
+    result.assert_outcomes(failed=len(get_available_backends()))
+
+
 def test_auto_mode(testdir: Pytester) -> None:
     testdir.makepyprojecttoml(
         """
@@ -554,7 +698,6 @@ def test_auto_mode(testdir: Pytester) -> None:
     )
     testdir.makepyfile(
         """
-        import inspect
         import pytest
 
         @pytest.fixture
@@ -567,6 +710,24 @@ def test_auto_mode(testdir: Pytester) -> None:
     )
 
     result = testdir.runpytest(*pytest_args)
+    result.assert_outcomes(passed=len(get_available_backends()))
+
+
+def test_auto_mode_cmdline(testdir: Pytester) -> None:
+    testdir.makepyfile(
+        """
+            import pytest
+
+            @pytest.fixture
+            async def fixt(request):
+                return 1
+
+            async def test_params(fixt):
+                assert fixt == 1
+            """
+    )
+
+    result = testdir.runpytest(*pytest_args, "--anyio-mode=auto")
     result.assert_outcomes(passed=len(get_available_backends()))
 
 
@@ -599,7 +760,6 @@ def test_auto_mode_conflict_warning(testdir: Pytester) -> None:
     )
     testdir.makepyfile(
         """
-        import inspect
         import pytest
 
         @pytest.fixture
@@ -621,7 +781,8 @@ def test_auto_mode_conflict_warning(testdir: Pytester) -> None:
 
 class TestFreePortFactory:
     @pytest.fixture(scope="class")
-    def families(self) -> Sequence[tuple[socket.AddressFamily, str]]:
+    @classmethod
+    def families(cls) -> Sequence[tuple[socket.AddressFamily, str]]:
         from .test_sockets import has_ipv6
 
         families: list[tuple[socket.AddressFamily, str]] = [
@@ -678,6 +839,35 @@ class TestFreePortFactory:
                 sock.bind((addr, free_udp_port))
 
 
+def test_programmatic_anyio_mark(testdir: Pytester) -> None:
+    """Test that the anyio marker added programmatically via pytest_collection_modifyitems
+    causes the test to be run (regression test for issue #422)."""
+    testdir.makeconftest(
+        """
+        import inspect
+        import pytest
+
+
+        def pytest_collection_modifyitems(session, config, items):
+            for item in items:
+                if (
+                    isinstance(item, pytest.Function)
+                    and inspect.iscoroutinefunction(item.function)
+                ):
+                    item.add_marker(pytest.mark.anyio)
+        """
+    )
+    testdir.makepyfile(
+        """
+        async def test_programmatically_marked():
+            pass
+        """
+    )
+
+    result = testdir.runpytest(*pytest_args)
+    result.assert_outcomes(passed=len(get_available_backends()))
+
+
 def test_func_as_parametrize_param_name(testdir: Pytester) -> None:
     """
     Test that "func" can be used as a parameter name in
@@ -696,3 +886,27 @@ def test_func_as_parametrize_param_name(testdir: Pytester) -> None:
 
     result = testdir.runpytest(*pytest_args)
     result.assert_outcomes(passed=len(get_available_backends()))
+
+
+def test_plugin_loads_with_filterwarnings_error(testdir: Pytester) -> None:
+    """
+    Regression test for Issue #1271: importing the plugin must not touch the
+    deprecated ``_pytest.python.CallSpec2`` alias, which crashes pytest at startup
+    on pytest >= 9.2 when ``filterwarnings = error`` is configured, as pytest applies
+    the ini filters while importing plugins.
+    """
+    testdir.makeini(
+        """
+        [pytest]
+        filterwarnings = error
+        """
+    )
+    testdir.makepyfile(
+        """
+        def test_ok():
+            assert True
+        """
+    )
+
+    result = testdir.runpytest_subprocess(*pytest_args)
+    result.assert_outcomes(passed=1)

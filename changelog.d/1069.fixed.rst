@@ -1,0 +1,1 @@
+Fixed asyncio task groups raising cancellation exceptions on exit without a child cancellation, and failing to propagate cancellation from an exited child.

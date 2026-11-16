@@ -3,7 +3,7 @@ from __future__ import annotations
 import types
 from abc import ABCMeta, abstractmethod
 from collections.abc import AsyncGenerator, Callable, Coroutine, Iterable
-from typing import Any, TypeVar
+from typing import Any, Self, TypeVar
 
 _T = TypeVar("_T")
 
@@ -14,7 +14,7 @@ class TestRunner(metaclass=ABCMeta):
     same event loop.
     """
 
-    def __enter__(self) -> TestRunner:
+    def __enter__(self) -> Self:
         return self
 
     @abstractmethod
@@ -62,4 +62,12 @@ class TestRunner(metaclass=ABCMeta):
 
         :param test_func: the test function
         :param kwargs: keyword arguments to call the test function with
+        """
+
+    @abstractmethod
+    def is_running(self) -> bool:
+        """
+        Check if the test runner is running.
+
+        :return: ``True`` if the coroutine is currently being run, ``False`` otherwise.
         """

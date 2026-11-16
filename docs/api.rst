@@ -32,7 +32,9 @@ Timeouts and cancellation
 -------------------------
 
 .. autofunction:: anyio.move_on_after
+.. autofunction:: anyio.move_on_at
 .. autofunction:: anyio.fail_after
+.. autofunction:: anyio.fail_at
 .. autofunction:: anyio.current_effective_deadline
 
 .. autoclass:: anyio.CancelScope
@@ -41,6 +43,7 @@ Task groups
 -----------
 
 .. autofunction:: anyio.create_task_group
+.. autoclass:: anyio.TaskHandle
 
 .. autoclass:: anyio.abc.TaskGroup
 .. autoclass:: anyio.abc.TaskStatus
@@ -191,6 +194,7 @@ Synchronization
 ---------------
 
 .. autoclass:: anyio.Event
+.. autoclass:: anyio.Future
 .. autoclass:: anyio.Lock
 .. autoclass:: anyio.Condition
 .. autoclass:: anyio.Semaphore
@@ -216,6 +220,33 @@ Asynchronous functools
 .. autofunction:: anyio.functools.cache
 .. autofunction:: anyio.functools.lru_cache
 .. autofunction:: anyio.functools.reduce
+
+.. _async-itertools:
+
+Asynchronous itertools
+----------------------
+
+.. autofunction:: anyio.itertools.accumulate
+.. autofunction:: anyio.itertools.batched
+.. autodata:: anyio.itertools.chain
+.. autoclass:: anyio.itertools.Chain
+.. autofunction:: anyio.itertools.combinations
+.. autofunction:: anyio.itertools.combinations_with_replacement
+.. autofunction:: anyio.itertools.compress
+.. autofunction:: anyio.itertools.count
+.. autofunction:: anyio.itertools.cycle
+.. autofunction:: anyio.itertools.dropwhile
+.. autofunction:: anyio.itertools.filterfalse
+.. autofunction:: anyio.itertools.groupby
+.. autofunction:: anyio.itertools.islice
+.. autofunction:: anyio.itertools.pairwise
+.. autofunction:: anyio.itertools.permutations
+.. autofunction:: anyio.itertools.product
+.. autofunction:: anyio.itertools.repeat
+.. autofunction:: anyio.itertools.starmap
+.. autofunction:: anyio.itertools.tee
+.. autofunction:: anyio.itertools.takewhile
+.. autofunction:: anyio.itertools.zip_longest
 
 Low level operations
 --------------------
@@ -248,8 +279,22 @@ Exceptions
 .. autoexception:: anyio.ConnectionFailed
 .. autoexception:: anyio.DelimiterNotFound
 .. autoexception:: anyio.EndOfStream
+.. autoexception:: anyio.FutureAlreadyFinished
+.. autoexception:: anyio.FutureCancelled
+.. autoexception:: anyio.FutureFailed
+.. autoexception:: anyio.FutureNotFinished
 .. autoexception:: anyio.IncompleteRead
 .. autoexception:: anyio.NoEventLoopError
 .. autoexception:: anyio.RunFinishedError
+.. autoexception:: anyio.TaskFailed
+.. autoexception:: anyio.TaskCancelled
+.. autoexception:: anyio.TaskNotFinished
 .. autoexception:: anyio.TypedAttributeLookupError
 .. autoexception:: anyio.WouldBlock
+
+Concurrency utilities
+---------------------
+
+.. autofunction:: anyio.amap
+.. autofunction:: anyio.as_completed
+.. autofunction:: anyio.gather

@@ -1,0 +1,1 @@
+Prevented background failures in async pytest fixtures from leaving the test runner cancelled, hanging teardown, or preventing unrelated tests from running (#805).

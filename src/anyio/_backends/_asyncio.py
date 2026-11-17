@@ -31,7 +31,7 @@ from collections.abc import (
     Sequence,
 )
 from concurrent.futures import Future
-from contextlib import AbstractContextManager, suppress
+from contextlib import AbstractContextManager, nullcontext, suppress
 from contextvars import Context, copy_context
 from dataclasses import dataclass, field
 from functools import partial, wraps
@@ -209,6 +209,7 @@ class CancelScope(BaseCancelScope):
         "_parent_scope",
         "_pending_uncancellations",
         "_shield",
+        "_task_group",
         "_tasks",
         "_timeout_handle",
     )
@@ -222,6 +223,7 @@ class CancelScope(BaseCancelScope):
 
         self._deadline = deadline
         self._shield = shield
+        self._task_group: weakref.ReferenceType[TaskGroup] | None = None
         self._parent_scope: CancelScope | None = None
         self._child_scopes: set[CancelScope] = set()
         self._cancel_called = False
@@ -618,6 +620,7 @@ else:
 class TaskGroup(abc.TaskGroup):
     def __init__(self) -> None:
         self.cancel_scope: CancelScope = CancelScope()
+        self.cancel_scope._task_group = weakref.ref(self)
         self._entered = False
         self._exceptions: list[BaseException] = []
         self._tasks: set[asyncio.Task] = set()
@@ -2292,6 +2295,7 @@ class TestRunner(abc.TestRunner):
         use_uvloop: bool = False,
         loop_factory: Callable[[], AbstractEventLoop] | None = None,
     ) -> None:
+        super().__init__()
         if use_uvloop and loop_factory is None:
             if sys.platform != "win32":
                 import uvloop
@@ -2305,6 +2309,9 @@ class TestRunner(abc.TestRunner):
         self._runner = Runner(debug=debug, loop_factory=loop_factory)
         self._exceptions: list[BaseException] = []
         self._runner_task: asyncio.Task | None = None
+        self._active_fixture_generators: list[
+            tuple[AsyncGenerator[Any, Any], CancelScope | None, object | None]
+        ] = []
 
     def __enter__(self) -> Self:
         self._runner.__enter__()
@@ -2357,14 +2364,20 @@ class TestRunner(abc.TestRunner):
         from _pytest.outcomes import OutcomeException
 
         with receive_stream, self._send_stream:
-            async for coro, future in receive_stream:
+            while True:
+                with CancelScope(shield=True):
+                    try:
+                        coro, future = await receive_stream.receive()
+                    except EndOfStream:
+                        break
+
                 try:
                     retval = await coro
                 except CancelledError as exc:
                     if not future.cancelled():
                         future.cancel(*exc.args)
 
-                    raise
+                    # Keep the runner alive so cancelled fixtures can be torn down.
                 except BaseException as exc:
                     if not future.cancelled():
                         future.set_exception(exc)
@@ -2399,44 +2412,99 @@ class TestRunner(abc.TestRunner):
         self,
         fixture_func: Callable[..., AsyncGenerator[T_Retval, Any]],
         kwargs: dict[str, Any],
+        fixture_id: object | None = None,
     ) -> Iterable[T_Retval]:
-        asyncgen = fixture_func(**kwargs)
+        original_asyncgen = fixture_func(**kwargs)
+        fixture_scope: list[CancelScope | None] = [None]
+
+        async def recovered_fixture() -> AsyncGenerator[T_Retval, Any]:
+            task_state = _task_states.get(cast(asyncio.Task, current_task()))
+            scope = task_state.cancel_scope if task_state else None
+            needs_shield = bool(self._active_fixture_generators) or (
+                scope is not None and scope._effectively_cancelled
+            )
+            recovery_scope = CancelScope(shield=True) if needs_shield else nullcontext()
+            # The shield must stay active across both halves of an async fixture.
+            with recovery_scope:
+                try:
+                    async for value in original_asyncgen:
+                        task_state = _task_states.get(
+                            cast(asyncio.Task, current_task())
+                        )
+                        fixture_scope[0] = (
+                            task_state.cancel_scope if task_state else None
+                        )
+                        yield value
+                finally:
+                    await original_asyncgen.aclose()
+
+        asyncgen = recovered_fixture()
         fixturevalue: T_Retval = self.get_loop().run_until_complete(
             self._call_in_runner_task(asyncgen.asend, None)
         )
         self._raise_async_exceptions()
 
-        yield fixturevalue
-
+        fixture_entry = (asyncgen, fixture_scope[0], fixture_id)
+        self._clear_failed_fixture(fixture_id)
+        self._active_fixture_generators.append(fixture_entry)
         try:
-            self.get_loop().run_until_complete(
-                self._call_in_runner_task(asyncgen.asend, None)
-            )
-        except StopAsyncIteration:
-            self._raise_async_exceptions()
-        else:
-            self.get_loop().run_until_complete(asyncgen.aclose())
-            raise RuntimeError("Async generator fixture did not stop")
+            yield fixturevalue
+
+            try:
+                self.get_loop().run_until_complete(
+                    self._call_in_runner_task(asyncgen.asend, None)
+                )
+            except StopAsyncIteration:
+                self._raise_async_exceptions()
+            else:
+                self.get_loop().run_until_complete(asyncgen.aclose())
+                raise RuntimeError("Async generator fixture did not stop")
+        finally:
+            if fixture_entry in self._active_fixture_generators:
+                self._active_fixture_generators.remove(fixture_entry)
+
+            self._clear_failed_fixture(fixture_id)
 
     def run_fixture(
         self,
         fixture_func: Callable[..., Coroutine[Any, Any, T_Retval]],
         kwargs: dict[str, Any],
     ) -> T_Retval:
+        async def run_fixture_in_runner_task() -> T_Retval:
+            task_state = _task_states.get(cast(asyncio.Task, current_task()))
+            scope = task_state.cancel_scope if task_state else None
+            if scope is not None and scope._effectively_cancelled:
+                with CancelScope(shield=True):
+                    return await fixture_func(**kwargs)
+
+            return await fixture_func(**kwargs)
+
         retval = self.get_loop().run_until_complete(
-            self._call_in_runner_task(fixture_func, **kwargs)
+            self._call_in_runner_task(run_fixture_in_runner_task)
         )
         self._raise_async_exceptions()
         return retval
 
     def run_test(
-        self, test_func: Callable[..., Coroutine[Any, Any, Any]], kwargs: dict[str, Any]
+        self,
+        test_func: Callable[..., Coroutine[Any, Any, Any]],
+        kwargs: dict[str, Any],
+        fixture_ids: frozenset[object] | None = None,
     ) -> None:
         from _pytest.outcomes import OutcomeException
 
+        async def run_test_in_runner_task() -> None:
+            task_state = _task_states.get(cast(asyncio.Task, current_task()))
+            scope = task_state.cancel_scope if task_state else None
+            if scope is not None and scope._effectively_cancelled:
+                with CancelScope(shield=True):
+                    await test_func(**kwargs)
+            else:
+                await test_func(**kwargs)
+
         try:
             self.get_loop().run_until_complete(
-                self._call_in_runner_task(test_func, **kwargs)
+                self._call_in_runner_task(run_test_in_runner_task)
             )
         except Exception as exc:
             self._exceptions.append(exc)
@@ -2456,6 +2524,61 @@ class TestRunner(abc.TestRunner):
                 finally:
                     self._runner_task = None
             raise
+        # A failed background task group can cancel the shared test-runner task
+        # while an upper-scoped fixture is still suspended at its yield. Resolve
+        # its failure now, against the triggering test, rather than silently
+        # letting it surface at the teardown of the last unrelated test.
+        if self._runner_task is not None:
+            task_state = _task_states.get(self._runner_task)
+            scope = task_state.cancel_scope if task_state else None
+            cancelled_parent = False
+            cursor = scope
+            while cursor is not None:
+                cancelled_parent |= cursor.cancel_called
+                cursor = cursor._parent_scope
+            if cancelled_parent:
+                for asyncgen, fixture_scope, fixture_id in reversed(
+                    self._active_fixture_generators[:]
+                ):
+                    if fixture_scope is None or not fixture_scope.cancel_called:
+                        break
+
+                    self._active_fixture_generators.remove(
+                        (asyncgen, fixture_scope, fixture_id)
+                    )
+                    try:
+                        self.get_loop().run_until_complete(
+                            self._call_in_runner_task(asyncgen.asend, None)
+                        )
+                    except StopAsyncIteration:
+                        pass
+                    except BaseException as exc:
+                        self._mark_failed_fixture(fixture_id, exc)
+                        if fixture_ids is None or fixture_id in fixture_ids:
+                            self._exceptions.append(exc)
+                        else:
+                            self._mark_unreported_fixture_error(fixture_id, exc)
+
+        # The failure of a fixture's child task can cancel an outer fixture
+        # while a later fixture is still alive. Surface the original exception
+        # against this test without tearing down the nested fixture out of order.
+        for _, fixture_scope, fixture_id in self._active_fixture_generators:
+            if fixture_scope is None or not fixture_scope.cancel_called:
+                continue
+
+            group_ref = fixture_scope._task_group
+            group = group_ref() if group_ref is not None else None
+            if group is not None and group._exceptions:
+                self._mark_failed_fixture(fixture_id, group._exceptions[0])
+                if fixture_ids is None or fixture_id in fixture_ids:
+                    self._exceptions.extend(group._exceptions)
+                else:
+                    self._mark_unreported_fixture_error(
+                        fixture_id, group._exceptions[0]
+                    )
+
+                group._exceptions.clear()
+
         self._raise_async_exceptions()
 
 

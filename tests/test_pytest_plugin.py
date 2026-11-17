@@ -96,6 +96,65 @@ def test_plugin(testdir: Pytester) -> None:
     )
 
 
+@pytest.mark.parametrize("backend", ("asyncio", "trio"))
+@pytest.mark.parametrize("fixture_scope", ("function", "module"))
+@pytest.mark.parametrize("later_fixture_kind", ("asyncgen", "coroutine"))
+def test_crashed_fixture_does_not_poison_later_tests(
+    testdir: Pytester, backend: str, fixture_scope: str, later_fixture_kind: str
+) -> None:
+    # A background child crashing must not kill the persistent test runner (#805).
+    later_fixture_body = (
+        "yield 42\n            await anyio.sleep(0)"
+        if later_fixture_kind == "asyncgen"
+        else "return 42"
+    )
+    testdir.makepyfile(
+        f"""
+        import anyio
+        import pytest
+
+        @pytest.fixture(scope="{fixture_scope}")
+        def anyio_backend():
+            return "{backend}"
+
+        @pytest.fixture(scope="{fixture_scope}")
+        async def crashing_fixture():
+            trigger = anyio.Event()
+
+            async def background(*, task_status):
+                task_status.started()
+                await trigger.wait()
+                raise RuntimeError("background fixture failure #805")
+
+            async with anyio.create_task_group() as group:
+                await group.start(background)
+                yield trigger
+
+        @pytest.fixture
+        async def unrelated_fixture():
+            await anyio.sleep(0)
+            {later_fixture_body}
+
+        @pytest.mark.anyio
+        async def test_trigger_background_failure(crashing_fixture):
+            crashing_fixture.set()
+            await anyio.sleep(0)
+
+        @pytest.mark.anyio
+        async def test_unrelated(unrelated_fixture):
+            assert unrelated_fixture == 42
+        """
+    )
+
+    result = testdir.runpytest_subprocess(*pytest_args, timeout=10)
+    output = result.stdout.str()
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    assert "RuntimeError: background fixture failure #805" in output
+    assert "test_unrelated PASSED" in output
+    assert "ClosedResourceError" not in output
+    assert "was never awaited" not in output
+
+
 def test_asyncio(testdir: Pytester, caplog: LogCaptureFixture) -> None:
     testdir.makeconftest(
         """
@@ -910,3 +969,474 @@ def test_plugin_loads_with_filterwarnings_error(testdir: Pytester) -> None:
 
     result = testdir.runpytest_subprocess(*pytest_args)
     result.assert_outcomes(passed=1)
+
+
+@pytest.mark.parametrize("backend", get_available_backends())
+def test_background_fixture_failure_is_attributed_before_unrelated_test(
+    testdir: Pytester, backend: str
+) -> None:
+    import os
+    import subprocess
+    import sys
+
+    test_file = testdir.makepyfile(
+        f"""
+        import anyio
+        import pytest
+
+        @pytest.fixture(scope="module")
+        def anyio_backend():
+            return {backend!r}
+
+        @pytest.fixture(scope="module")
+        async def service():
+            async def background():
+                raise RuntimeError("MODULE_BACKGROUND_CRASH")
+
+            async with anyio.create_task_group() as task_group:
+                task_group.start_soon(background)
+                yield "ready"
+
+        @pytest.mark.anyio
+        async def test_uses_service(service):
+            await anyio.sleep(0)
+
+        @pytest.mark.anyio
+        async def test_unrelated():
+            await anyio.sleep(0)
+        """
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "--tb=short",
+            "-p",
+            "anyio",
+            "-p",
+            "no:asyncio",
+            "-p",
+            "no:trio",
+            str(test_file),
+        ],
+        cwd=os.path.dirname(str(test_file)),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=8,
+        check=False,
+    )
+    assert "MODULE_BACKGROUND_CRASH" in result.stdout
+    assert "1 passed" in result.stdout
+    assert "ERROR at teardown of test_unrelated" not in result.stdout
+
+
+@pytest.mark.parametrize("backend", get_available_backends())
+def test_failed_module_fixture_keeps_other_fixtures_active(
+    testdir: Pytester, backend: str
+) -> None:
+    import os
+    import subprocess
+    import sys
+
+    test_file = testdir.makepyfile(
+        f"""
+        import anyio
+        import pytest
+
+        @pytest.fixture(scope="module")
+        def anyio_backend():
+            return {backend!r}
+
+        @pytest.fixture(scope="module")
+        async def healthy():
+            state = {{"closed": False}}
+            async with anyio.create_task_group() as task_group:
+                task_group.start_soon(anyio.sleep_forever)
+                yield state
+                state["closed"] = True
+                task_group.cancel_scope.cancel()
+
+        @pytest.fixture(scope="module")
+        async def broken(healthy):
+            async def crash():
+                raise RuntimeError("BROKEN_MODULE")
+
+            async with anyio.create_task_group() as task_group:
+                task_group.start_soon(crash)
+                yield healthy
+
+        @pytest.mark.anyio
+        async def test_broken(broken):
+            await anyio.sleep(0)
+
+        @pytest.mark.anyio
+        async def test_healthy(healthy):
+            assert healthy["closed"] is False, "HEALTHY_FIXTURE_CLOSED"
+        """
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "--tb=short",
+            "-p",
+            "anyio",
+            "-p",
+            "no:asyncio",
+            "-p",
+            "no:trio",
+            str(test_file),
+        ],
+        cwd=os.path.dirname(str(test_file)),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=8,
+        check=False,
+    )
+    assert "BROKEN_MODULE" in result.stdout
+    assert "1 failed, 1 passed" in result.stdout
+    assert "HEALTHY_FIXTURE_CLOSED" not in result.stdout
+    assert "ERROR at teardown of test_healthy" not in result.stdout
+
+
+@pytest.mark.parametrize("backend", get_available_backends())
+def test_failed_outer_module_fixture_preserves_nested_fixture_scope(
+    testdir: Pytester, backend: str
+) -> None:
+    """An outer fixture failure must not unwind a still-active inner fixture."""
+    import os
+    import subprocess
+    import sys
+
+    test_file = testdir.makepyfile(
+        f"""
+        import anyio
+        import pytest
+
+        @pytest.fixture(scope="module")
+        def anyio_backend():
+            return {backend!r}
+
+        @pytest.fixture(scope="module")
+        async def broken():
+            trigger = anyio.Event()
+
+            async def crash():
+                await trigger.wait()
+                raise RuntimeError("REVERSED_BROKEN")
+
+            async with anyio.create_task_group() as task_group:
+                task_group.start_soon(crash)
+                yield trigger
+
+        @pytest.fixture(scope="module")
+        async def healthy():
+            state = {{"closed": False}}
+            async with anyio.create_task_group() as task_group:
+                task_group.start_soon(anyio.sleep_forever)
+                yield state
+                state["closed"] = True
+                task_group.cancel_scope.cancel()
+
+        @pytest.mark.anyio
+        async def test_triggers(broken, healthy):
+            broken.set()
+            await anyio.sleep(0)
+
+        @pytest.mark.anyio
+        async def test_unrelated(healthy):
+            assert not healthy["closed"], "UNRELATED_HEALTHY_CLOSED"
+        """
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-rA",
+            "--tb=short",
+            "-p",
+            "anyio",
+            "-p",
+            "no:asyncio",
+            "-p",
+            "no:trio",
+            str(test_file),
+        ],
+        cwd=os.path.dirname(str(test_file)),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=8,
+        check=False,
+    )
+    assert "PASSED " in result.stdout and "::test_unrelated" in result.stdout
+    assert "1 error" in result.stdout or "1 failed" in result.stdout
+    assert "UNRELATED_HEALTHY_CLOSED" not in result.stdout
+    assert "REVERSED_BROKEN" in result.stdout
+    assert "ERROR at teardown of test_unrelated" not in result.stdout
+    assert "Attempted to exit a cancel scope" not in result.stdout
+    assert "Cancel scope stack corrupted" not in result.stdout
+    assert "Nursery stack corrupted" not in result.stdout
+
+
+@pytest.mark.parametrize("backend", get_available_backends())
+def test_failing_test_and_fixture_child_both_fail_original_test(
+    testdir: Pytester, backend: str
+) -> None:
+    testdir.makepyfile(
+        f"""
+        import anyio
+        import pytest
+
+        @pytest.fixture(scope="module")
+        def anyio_backend():
+            return {backend!r}
+
+        @pytest.fixture(scope="module")
+        async def service():
+            trigger = anyio.Event()
+
+            async def crash():
+                await trigger.wait()
+                raise RuntimeError("BACKGROUND_ALSO_FAILED")
+
+            async with anyio.create_task_group() as group:
+                group.start_soon(crash)
+                yield trigger
+
+        @pytest.mark.anyio
+        async def test_simultaneous_errors(service):
+            service.set()
+            raise AssertionError("USER_ASSERTION_FAILED")
+
+        @pytest.mark.anyio
+        async def test_unrelated():
+            assert True
+        """
+    )
+
+    result = testdir.runpytest_subprocess(*pytest_args, "--tb=short", timeout=10)
+    result.assert_outcomes(failed=1, passed=1)
+    output = result.stdout.str()
+    assert "USER_ASSERTION_FAILED" in output
+    assert "BACKGROUND_ALSO_FAILED" in output
+    assert "test_unrelated PASSED" in output
+
+
+@pytest.mark.parametrize("backend", get_available_backends())
+def test_delayed_fixture_crash_does_not_fail_unrelated_test(
+    testdir: Pytester, backend: str
+) -> None:
+    testdir.makepyfile(
+        f"""
+        import anyio
+        import pytest
+
+        @pytest.fixture(scope="module")
+        def anyio_backend():
+            return {backend!r}
+
+        @pytest.fixture(scope="module")
+        async def shared_service():
+            trigger = anyio.Event()
+
+            async def crash_later():
+                await trigger.wait()
+                await anyio.sleep(0)
+                await anyio.sleep(0)
+                raise RuntimeError("DELAYED_CHILD_CRASH")
+
+            async with anyio.create_task_group() as group:
+                group.start_soon(crash_later)
+                yield trigger
+
+        @pytest.mark.anyio
+        async def test_trigger_without_await(shared_service):
+            shared_service.set()
+
+        @pytest.mark.anyio
+        async def test_unrelated():
+            assert True
+
+        @pytest.mark.anyio
+        async def test_dependent(shared_service):
+            print("RAN_WITH_FAILED_SERVICE")
+        """
+    )
+    result = testdir.runpytest_subprocess(*pytest_args, "-s", "--tb=short", timeout=10)
+    output = result.stdout.str()
+    assert "DELAYED_CHILD_CRASH" in output
+    assert "test_unrelated PASSED" in output
+    assert "test_dependent ERROR" in output
+    assert "RAN_WITH_FAILED_SERVICE" not in output
+
+
+@pytest.mark.parametrize("backend", get_available_backends())
+def test_late_fixture_crash_without_dependents_fails_session(
+    testdir: Pytester, backend: str
+) -> None:
+    testdir.makepyfile(
+        f"""
+        import anyio
+        import pytest
+
+        @pytest.fixture(scope="module")
+        def anyio_backend():
+            return {backend!r}
+
+        @pytest.fixture(scope="module")
+        async def service():
+            trigger = anyio.Event()
+
+            async def crash_later():
+                await trigger.wait()
+                await anyio.sleep(0)
+                await anyio.sleep(0)
+                raise RuntimeError("MUST_REPORT_CHILD_FAILURE")
+
+            async with anyio.create_task_group() as group:
+                group.start_soon(crash_later)
+                yield trigger
+
+        @pytest.mark.anyio
+        async def test_trigger_without_await(service):
+            service.set()
+
+        @pytest.mark.anyio
+        async def test_unrelated():
+            assert True
+        """
+    )
+    result = testdir.runpytest_subprocess(*pytest_args, "--tb=short", timeout=10)
+    output = result.stdout.str()
+    assert result.ret == 1
+    assert "test_unrelated PASSED" in output
+    assert "MUST_REPORT_CHILD_FAILURE" in output
+    assert "unreported async fixture failures" in output
+
+
+@pytest.mark.parametrize("backend", get_available_backends())
+def test_broken_module_fixture_does_not_serve_later_dependent_test(
+    testdir: Pytester, backend: str
+) -> None:
+    testdir.makepyfile(
+        f"""
+        import anyio
+        import pytest
+
+        @pytest.fixture(scope="module")
+        def anyio_backend():
+            return {backend!r}
+
+        @pytest.fixture(scope="module")
+        async def shared_service():
+            trigger = anyio.Event()
+
+            async def crash():
+                await trigger.wait()
+                raise RuntimeError("SHARED_WORKER_DIED")
+
+            async with anyio.create_task_group() as group:
+                group.start_soon(crash)
+                yield trigger
+
+        @pytest.mark.anyio
+        async def test_break_service(shared_service):
+            shared_service.set()
+            await anyio.sleep(0)
+
+        @pytest.fixture
+        async def dependent_service(shared_service):
+            print("UNEXPECTED_DEPENDENT_FIXTURE_SETUP")
+            await anyio.sleep(0)
+            return shared_service
+
+        @pytest.mark.anyio
+        async def test_reuses_broken_service(dependent_service):
+            print("RAN_WITH_DEAD_SERVICE")
+
+        @pytest.mark.anyio
+        async def test_unrelated():
+            assert True
+        """
+    )
+
+    result = testdir.runpytest_subprocess(*pytest_args, "-s", "--tb=short", timeout=10)
+    result.assert_outcomes(failed=1, errors=1, passed=1)
+    output = result.stdout.str()
+    assert "SHARED_WORKER_DIED" in output
+    assert "RAN_WITH_DEAD_SERVICE" not in output
+    assert "UNEXPECTED_DEPENDENT_FIXTURE_SETUP" not in output
+    assert "test_unrelated PASSED" in output
+
+
+@pytest.mark.parametrize("backend", get_available_backends())
+def test_intentional_module_task_group_cancel_keeps_fixture(
+    testdir: Pytester, backend: str
+) -> None:
+    """An explicit cancel must not eagerly tear down a module-scoped fixture."""
+    import os
+    import subprocess
+    import sys
+
+    test_file = testdir.makepyfile(
+        f"""
+        import anyio
+        import pytest
+
+        @pytest.fixture(scope="module")
+        def anyio_backend():
+            return {backend!r}
+
+        @pytest.fixture(scope="module")
+        async def service():
+            state = {{"closed": False}}
+            async with anyio.create_task_group() as task_group:
+                task_group.start_soon(anyio.sleep_forever)
+                state["group"] = task_group
+                yield state
+                state["closed"] = True
+
+        @pytest.mark.anyio
+        async def test_cancel(service):
+            service["group"].cancel_scope.cancel()
+            await anyio.sleep(0)
+
+        @pytest.mark.anyio
+        async def test_unrelated(service):
+            assert not service["closed"], "PREMATURE_FIXTURE_CLOSE"
+        """
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-rA",
+            "--tb=short",
+            "-p",
+            "anyio",
+            "-p",
+            "no:asyncio",
+            "-p",
+            "no:trio",
+            str(test_file),
+        ],
+        cwd=os.path.dirname(str(test_file)),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=8,
+        check=False,
+    )
+    assert "PASSED " in result.stdout and "::test_unrelated" in result.stdout
+    assert "PREMATURE_FIXTURE_CLOSE" not in result.stdout

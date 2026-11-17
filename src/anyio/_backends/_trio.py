@@ -17,7 +17,7 @@ from collections.abc import (
     Iterable,
     Sequence,
 )
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from contextvars import Context, copy_context
 from dataclasses import dataclass
 from functools import partial, wraps
@@ -960,6 +960,7 @@ class _SignalReceiver:
 
 class TestRunner(abc.TestRunner):
     def __init__(self, **options: Any) -> None:
+        super().__init__()
         from queue import Queue
 
         self._call_queue: Queue[Callable[[], object]] = Queue()
@@ -967,6 +968,9 @@ class TestRunner(abc.TestRunner):
             MemoryObjectSendStream[tuple[Awaitable[Any], list[Outcome]]] | None
         ) = None
         self._options = options
+        self._active_fixture_generators: list[
+            tuple[AsyncGenerator[Any, Any], trio.CancelScope | None, object | None]
+        ] = []
 
     def __exit__(
         self,
@@ -987,7 +991,13 @@ class TestRunner(abc.TestRunner):
             tuple[Awaitable[Any], list[Outcome]]
         ](1)
         with receive_stream:
-            async for awaitable, outcome_holder in receive_stream:
+            while True:
+                with trio.CancelScope(shield=True):
+                    try:
+                        awaitable, outcome_holder = await receive_stream.receive()
+                    except EndOfStream:
+                        break
+
                 try:
                     retval = await awaitable
                 except BaseException as exc:
@@ -1026,31 +1036,184 @@ class TestRunner(abc.TestRunner):
         self,
         fixture_func: Callable[..., AsyncGenerator[T_Retval, Any]],
         kwargs: dict[str, Any],
+        fixture_id: object | None = None,
     ) -> Iterable[T_Retval]:
-        asyncgen = fixture_func(**kwargs)
+        original_asyncgen = fixture_func(**kwargs)
+        fixture_scope: list[trio.CancelScope | None] = [None]
+
+        async def recovered_fixture() -> AsyncGenerator[T_Retval, Any]:
+            needs_shield = bool(self._active_fixture_generators) or (
+                trio.current_effective_deadline() == -math.inf
+            )
+            recovery_scope = (
+                trio.CancelScope(shield=True) if needs_shield else nullcontext()
+            )
+            # The shield must stay active across both halves of an async fixture.
+            with recovery_scope:
+                try:
+                    async for value in original_asyncgen:
+                        fixture_scope[0] = (
+                            trio.lowlevel.current_task()._cancel_status._scope
+                        )
+                        yield value
+                finally:
+                    await original_asyncgen.aclose()
+
+        asyncgen = recovered_fixture()
         fixturevalue: T_Retval = self._call_in_runner_task(asyncgen.asend, None)
 
-        yield fixturevalue
-
+        fixture_entry = (asyncgen, fixture_scope[0], fixture_id)
+        self._clear_failed_fixture(fixture_id)
+        self._active_fixture_generators.append(fixture_entry)
         try:
-            self._call_in_runner_task(asyncgen.asend, None)
-        except StopAsyncIteration:
-            pass
-        else:
-            self._call_in_runner_task(asyncgen.aclose)
-            raise RuntimeError("Async generator fixture did not stop")
+            yield fixturevalue
+
+            try:
+                self._call_in_runner_task(asyncgen.asend, None)
+            except StopAsyncIteration:
+                pass
+            else:
+                self._call_in_runner_task(asyncgen.aclose)
+                raise RuntimeError("Async generator fixture did not stop")
+        finally:
+            if fixture_entry in self._active_fixture_generators:
+                self._active_fixture_generators.remove(fixture_entry)
+
+            self._clear_failed_fixture(fixture_id)
 
     def run_fixture(
         self,
         fixture_func: Callable[..., Coroutine[Any, Any, T_Retval]],
         kwargs: dict[str, Any],
     ) -> T_Retval:
-        return self._call_in_runner_task(fixture_func, **kwargs)
+        async def run_fixture_in_runner_task() -> T_Retval:
+            if trio.current_effective_deadline() == -math.inf:
+                with trio.CancelScope(shield=True):
+                    return await fixture_func(**kwargs)
+
+            return await fixture_func(**kwargs)
+
+        return self._call_in_runner_task(run_fixture_in_runner_task)
+
+    def _recover_failed_fixtures(
+        self, fixture_ids: frozenset[object] | None = None
+    ) -> None:
+        errors: list[BaseException] = []
+        active_fixtures = self._active_fixture_generators[:]
+        for index in range(len(active_fixtures) - 1, -1, -1):
+            asyncgen, fixture_scope, fixture_id = active_fixtures[index]
+            if fixture_scope is None or not fixture_scope.cancel_called:
+                break
+
+            # Explicit cancellation of a fixture task group is not a child
+            # failure. Closing the fixture here would also close resources
+            # that later tests in the same scope still need.
+            reason = getattr(fixture_scope, "_cancel_reason", None)
+            if getattr(reason, "source", None) != "nursery":
+                break
+
+            # A canceled outer nursery can propagate cancellation into
+            # independent inner fixtures. They must remain nested until
+            # pytest's normal teardown; forcing either scope closed now
+            # corrupts the nursery stack or kills an unrelated fixture.
+            if any(
+                outer_scope is not None and outer_scope.cancel_called
+                for _, outer_scope, _ in active_fixtures[:index]
+            ):
+                break
+
+            self._active_fixture_generators.remove(
+                (asyncgen, fixture_scope, fixture_id)
+            )
+            try:
+                self._call_in_runner_task(asyncgen.asend, None)
+            except StopAsyncIteration:
+                pass
+            except BaseException as exc:
+                self._mark_failed_fixture(fixture_id, exc)
+                if fixture_ids is None or fixture_id in fixture_ids:
+                    errors.append(exc)
+                else:
+                    self._mark_unreported_fixture_error(fixture_id, exc)
+
+        if len(errors) == 1:
+            raise errors[0] from None
+        elif errors:
+            raise BaseExceptionGroup("Failed async fixtures", errors) from None
 
     def run_test(
-        self, test_func: Callable[..., Coroutine[Any, Any, Any]], kwargs: dict[str, Any]
+        self,
+        test_func: Callable[..., Coroutine[Any, Any, Any]],
+        kwargs: dict[str, Any],
+        fixture_ids: frozenset[object] | None = None,
     ) -> None:
-        self._call_in_runner_task(test_func, **kwargs)
+        async def run_test_in_runner_task() -> None:
+            test_error: Exception | None = None
+            try:
+                if trio.current_effective_deadline() == -math.inf:
+                    with trio.CancelScope(shield=True):
+                        await test_func(**kwargs)
+                else:
+                    await test_func(**kwargs)
+            except Exception as exc:
+                # A test assertion must not skip the checkpoint that discovers
+                # background failures from fixtures used by that same test.
+                test_error = exc
+
+            errors: list[BaseException] = []
+            if self._active_fixture_generators:
+                # Let pending fixture children run once without turning an
+                # unrelated successful test into a second cancellation error.
+                await trio.lowlevel.cancel_shielded_checkpoint()
+                await trio.lowlevel.cancel_shielded_checkpoint()
+
+                # A failed outer fixture cannot be unwound while a healthy
+                # inner fixture still owns a nursery. Report its pending child
+                # exception now, preserving the normal teardown nesting.
+                scopes = {
+                    scope: fixture_id
+                    for _, scope, fixture_id in self._active_fixture_generators
+                    if scope is not None and scope.cancel_called
+                }
+                for nursery in trio.lowlevel.current_task().child_nurseries:
+                    if nursery.cancel_scope not in scopes:
+                        continue
+
+                    reason = getattr(nursery.cancel_scope, "_cancel_reason", None)
+                    if getattr(reason, "source", None) != "nursery":
+                        continue
+
+                    pending = [
+                        exc
+                        for exc in nursery._pending_excs
+                        if not isinstance(exc, trio.Cancelled)
+                    ]
+                    if pending:
+                        fixture_id = scopes[nursery.cancel_scope]
+                        self._mark_failed_fixture(fixture_id, pending[0])
+                        if fixture_ids is None or fixture_id in fixture_ids:
+                            errors.extend(pending)
+                        else:
+                            self._mark_unreported_fixture_error(fixture_id, pending[0])
+
+                    for pending_error in pending:
+                        nursery._pending_excs.remove(pending_error)
+
+            if test_error is not None:
+                errors.insert(0, test_error)
+
+            if len(errors) == 1:
+                raise errors[0]
+            elif errors:
+                raise BaseExceptionGroup("Test and fixture failures", errors)
+
+        try:
+            self._call_in_runner_task(run_test_in_runner_task)
+        except trio.Cancelled:
+            self._recover_failed_fixtures(fixture_ids)
+            raise
+        else:
+            self._recover_failed_fixtures(fixture_ids)
 
 
 class TrioTaskInfo(TaskInfo):
